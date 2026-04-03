@@ -3,9 +3,11 @@
 // ============================================================
 
 import { joinSession } from "@github/copilot-sdk/extension";
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, renameSync, unlinkSync } from "node:fs";
 import { join, basename } from "node:path";
+import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
+import { execFile, execSync } from "node:child_process";
 
 // ============================================================
 // Section 1: Constants & Configuration
@@ -15,7 +17,7 @@ const EXT_DIR = import.meta.dirname;
 const ACCESS_PATH = join(EXT_DIR, "access.json");
 const BOTS_REGISTRY_PATH = join(EXT_DIR, "bots.json");
 const BOTS_DIR = join(EXT_DIR, "bots");
-const TMP_DIR = join("/tmp", `telegram-bridge-${process.pid}`);
+const TMP_DIR = join(tmpdir(), `telegram-bridge-${process.pid}`);
 
 const TELEGRAM_API = "https://api.telegram.org";
 const POLL_TIMEOUT = 30;
@@ -209,7 +211,7 @@ async function callTelegram(method, params = {}) {
 function getMe() { return callTelegram("getMe"); }
 
 function getUpdates(offset, timeout) {
-    return callTelegram("getUpdates", { offset, timeout, allowed_updates: ["message"] });
+    return callTelegram("getUpdates", { offset, timeout, allowed_updates: ["message", "edited_message", "callback_query"] });
 }
 
 function sendMessage(chatId, text, parseMode) {
@@ -242,7 +244,7 @@ async function sendPhoto(chatId, base64Data, mimeType, caption) {
     if (caption) form.append("caption", caption.slice(0, 1024));
 
     const url = `${TELEGRAM_API}/bot${botToken}/sendPhoto`;
-    const res = await fetch(url, { method: "POST", body: form });
+    const res = await fetch(url, { method: "POST", body: form, signal: AbortSignal.timeout(API_TIMEOUT_MS) });
     if (!res.ok) {
         const body = await res.text().catch(() => "");
         throw new Error(`Telegram sendPhoto failed: ${res.status} ${body}`);
@@ -258,7 +260,7 @@ async function sendDocument(chatId, base64Data, mimeType, filename, caption) {
     if (caption) form.append("caption", caption.slice(0, 1024));
 
     const url = `${TELEGRAM_API}/bot${botToken}/sendDocument`;
-    const res = await fetch(url, { method: "POST", body: form });
+    const res = await fetch(url, { method: "POST", body: form, signal: AbortSignal.timeout(API_TIMEOUT_MS) });
     if (!res.ok) {
         const body = await res.text().catch(() => "");
         throw new Error(`Telegram sendDocument failed: ${res.status} ${body}`);
@@ -298,10 +300,66 @@ async function downloadFile(filePath) {
     if (!res.ok) throw new Error(`Download failed: ${res.status}`);
     const buffer = Buffer.from(await res.arrayBuffer());
     ensureTmpDir();
-    const localName = basename(filePath);
+    const localName = `${Date.now()}-${randomBytes(4).toString("hex")}-${basename(filePath)}`;
     const localPath = join(TMP_DIR, localName);
     writeFileSync(localPath, buffer);
     return localPath;
+}
+
+// ============================================================
+// Section 3b: Voice Message Transcription
+// ============================================================
+
+function runShellCommand(cmd, args, timeoutMs = 30000) {
+    return new Promise((resolve) => {
+        execFile(cmd, args, { timeout: timeoutMs }, (err, stdout, stderr) => {
+            if (err) resolve({ ok: false, error: stderr || err.message });
+            else resolve({ ok: true, output: stdout.trim() });
+        });
+    });
+}
+
+let ffmpegAvailable = null;
+async function checkFfmpeg() {
+    if (ffmpegAvailable !== null) return ffmpegAvailable;
+    const result = await runShellCommand("ffmpeg", ["-version"], 5000);
+    ffmpegAvailable = result.ok;
+    return ffmpegAvailable;
+}
+
+async function transcribeVoice(oggPath) {
+    // Step 1: Convert OGG/OPUS to WAV using ffmpeg
+    if (!(await checkFfmpeg())) return null;
+
+    const wavPath = oggPath.replace(/\.[^.]+$/, ".wav");
+    const convert = await runShellCommand("ffmpeg", [
+        "-i", oggPath, "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", wavPath, "-y",
+    ], 15000);
+    if (!convert.ok) return null;
+
+    // Step 2: Transcribe WAV using Windows Speech Recognition
+    const psScript = `
+Add-Type -AssemblyName System.Speech
+$recognizer = New-Object System.Speech.Recognition.SpeechRecognitionEngine
+$recognizer.SetInputToWaveFile('${wavPath.replace(/\\/g, "\\\\")}')
+$grammar = New-Object System.Speech.Recognition.DictationGrammar
+$recognizer.LoadGrammar($grammar)
+try {
+    $result = $recognizer.Recognize()
+    if ($result -and $result.Text) { Write-Output $result.Text }
+    else { Write-Output "[NO_SPEECH]" }
+} catch { Write-Output "[ERROR] $_" }
+finally { $recognizer.Dispose() }
+`;
+    const result = await runShellCommand("powershell", ["-NoProfile", "-Command", psScript], 30000);
+
+    // Cleanup temp WAV
+    try { unlinkSync(wavPath); } catch {}
+
+    if (!result.ok || !result.output || result.output === "[NO_SPEECH]" || result.output.startsWith("[ERROR]")) {
+        return null;
+    }
+    return result.output;
 }
 
 // ============================================================
@@ -349,7 +407,9 @@ let session;
 let abortController;
 let shutdownRequested = false;
 let awaitingInput = null;
+let awaitingPermission = null;
 let connected = false;
+let compactMode = false;
 
 let botInfo = null;
 let currentSessionId = null;
@@ -569,6 +629,7 @@ function composeBubbleText() {
 
 function scheduleBubbleUpdate() {
     if (!bubbleActive) return;
+    if (compactMode) return;
     if (bubbleDebounceTimer) clearTimeout(bubbleDebounceTimer);
     bubbleDebounceTimer = setTimeout(flushBubble, BUBBLE_DEBOUNCE_MS);
 }
@@ -697,12 +758,48 @@ function getAllowedChatIds() {
 }
 
 async function processUpdate(update) {
-    const message = update.message;
+    // --- Handle callback queries (inline keyboard responses) ---
+    if (update.callback_query) {
+        const cbq = update.callback_query;
+        const cbChatId = cbq.message?.chat?.id;
+        const cbUserId = cbq.from?.id;
+        const cbUserIdStr = String(cbUserId);
+        const cbData = cbq.data;
+
+        reloadAccess();
+
+        // Dismiss the spinner immediately
+        enqueue(() => callTelegram("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {}));
+
+        if (cbChatId != null && cbUserId != null && isAllowed(cbUserIdStr)) {
+            if (awaitingPermission && (cbData === "perm_allow" || cbData === "perm_deny")) {
+                const approved = cbData === "perm_allow";
+                const { resolve } = awaitingPermission;
+                clearTimeout(awaitingPermission.timer);
+                awaitingPermission = null;
+
+                // Edit the original permission message to show the decision
+                const decisionText = approved ? "✅ Permission granted" : "❌ Permission denied";
+                enqueue(() => callTelegram("editMessageText", {
+                    chat_id: cbChatId,
+                    message_id: cbq.message.message_id,
+                    text: decisionText,
+                }).catch(() => {}));
+
+                resolve(approved ? { kind: "approved" } : { kind: "denied-by-rules", rules: [] });
+                return;
+            }
+        }
+        // Unknown callback data — ignore
+        return;
+    }
+
+    const message = update.message || update.edited_message;
     if (!message) return;
 
-    const chatId = message.chat.id;
+    const chatId = message.chat?.id;
     const userId = message.from?.id;
-    if (userId == null) return;
+    if (chatId == null || userId == null) return;
     const text = message.text || message.caption || "";
     const userIdStr = String(userId);
 
@@ -718,8 +815,41 @@ async function processUpdate(update) {
         return;
     }
 
+    // If awaiting permission response and sender is allowed, resolve (text-based fallback)
+    if (awaitingPermission && isAllowed(userIdStr)) {
+        const lower = text.trim().toLowerCase();
+        const approved = ["yes", "y", "allow", "approve", "ok", "1"].includes(lower);
+        const denied = ["no", "n", "deny", "reject", "0"].includes(lower);
+        if (approved || denied) {
+            const { resolve } = awaitingPermission;
+            clearTimeout(awaitingPermission.timer);
+            awaitingPermission = null;
+            resolve(approved ? { kind: "approved" } : { kind: "denied-by-rules", rules: [] });
+            return;
+        }
+    }
+
     if (!isAllowed(userIdStr)) {
         await handlePairing(chatId, userId, text);
+        return;
+    }
+
+    // Handle /stop command — cancel the current agent turn
+    if (text.trim().toLowerCase() === "/stop") {
+        try {
+            if (typeof session.cancel === "function") {
+                await session.cancel();
+            } else if (session.connection && typeof session.connection.sendRequest === "function") {
+                await session.connection.sendRequest("session.cancel", { sessionId: session.sessionId });
+            } else {
+                await session.send({ cancel: true });
+            }
+        } catch (err) {
+            console.error("telegram-bridge: cancel error:", err.message);
+        }
+        await enqueue(() => sendMessage(chatId, "⏹️ Cancel requested."));
+        stopTyping();
+        await dismissBubble();
         return;
     }
 
@@ -749,12 +879,177 @@ async function processUpdate(update) {
         }
     }
 
+    // Handle voice messages
+    if (message.voice || message.audio) {
+        const voice = message.voice || message.audio;
+        try {
+            const fileInfo = await getFile(voice.file_id);
+            const localPath = await downloadFile(fileInfo.file_path);
+            const caption = message.caption || "";
+
+            // Try local transcription (ffmpeg + Windows Speech Recognition)
+            const transcribed = await transcribeVoice(localPath);
+            if (transcribed) {
+                const prompt = caption
+                    ? `${caption}\n\n[Voice message transcription]: ${transcribed}`
+                    : transcribed;
+                await session.send({ prompt });
+                return;
+            }
+
+            // Fallback: send as file attachment for the agent to handle
+            const displayName = `voice_${message.message_id}.ogg`;
+            await session.send({
+                prompt: caption || "The user sent a voice message. Please transcribe it if possible, or let them know voice transcription requires ffmpeg to be installed.",
+                attachments: [{ type: "file", path: localPath, displayName }],
+            });
+            return;
+        } catch (err) {
+            await enqueue(() => sendMessage(chatId, `Failed to process voice message: ${err.message}`));
+            return;
+        }
+    }
+
+    // Handle /compact toggle command
+    if (text.trim().toLowerCase() === "/compact") {
+        compactMode = !compactMode;
+        const msg = compactMode
+            ? "🔇 Compact mode ON — only final responses shown"
+            : "🔊 Compact mode OFF — all updates shown";
+        await enqueue(() => sendMessage(chatId, msg));
+        return;
+    }
+
     if (text) {
         await session.send({ prompt: text });
         return;
     }
 
-    await enqueue(() => sendMessage(chatId, "Unsupported message type. Text, photos, and documents only."));
+    await enqueue(() => sendMessage(chatId, "Unsupported message type. Supported: text, photos, documents, and voice messages."));
+}
+
+// ============================================================
+// Section 9b: Render ask_user prompt for Telegram
+// ============================================================
+
+function renderAskUserPrompt(args) {
+    let questionText = args.question || args.message || "Input needed:";
+
+    if (args.requestedSchema?.properties) {
+        const props = args.requestedSchema.properties;
+        const lines = [questionText, ""];
+        for (const [key, field] of Object.entries(props)) {
+            const label = field.title || key;
+            if (field.enum && field.enum.length > 0) {
+                const names = field.enumNames || field.enum;
+                lines.push(`${label}:`);
+                names.forEach((name, i) => {
+                    const marker = field.default === field.enum[i] ? " ✓" : "";
+                    lines.push(`  ${i + 1}) ${name}${marker}`);
+                });
+            } else if (field.oneOf && field.oneOf.length > 0) {
+                lines.push(`${label}:`);
+                field.oneOf.forEach((opt, i) => {
+                    const marker = field.default === opt.const ? " ✓" : "";
+                    lines.push(`  ${i + 1}) ${opt.title || opt.const}${marker}`);
+                });
+            } else if (field.type === "boolean") {
+                const def = field.default != null ? ` (default: ${field.default ? "yes" : "no"})` : "";
+                lines.push(`${label}: yes/no${def}`);
+            } else {
+                const def = field.default != null ? ` (default: ${field.default})` : "";
+                lines.push(`${label}${def}`);
+            }
+            if (field.description) lines.push(`  → ${field.description}`);
+        }
+        lines.push("", "↩️ Reply in the terminal to answer.");
+        questionText = lines.join("\n");
+    }
+
+    return questionText;
+}
+
+// ============================================================
+// Section 9c: Permission request handler for Telegram
+// ============================================================
+
+function createPermissionHandler() {
+    return (request) => {
+        if (!connected) return { kind: "no-result" };
+
+        const lines = ["🔐 **Permission requested**", ""];
+
+        if (request.kind === "shell") {
+            lines.push(`Type: Shell command`);
+            if (request.fullCommandText) {
+                lines.push(`Command: \`${request.fullCommandText}\``);
+            }
+        } else if (request.kind === "write") {
+            lines.push(`Type: File write`);
+            if (request.path) lines.push(`Path: \`${request.path}\``);
+        } else if (request.kind === "read") {
+            lines.push(`Type: File read`);
+            if (request.path) lines.push(`Path: \`${request.path}\``);
+        } else if (request.kind === "mcp") {
+            lines.push(`Type: MCP tool`);
+            if (request.toolName) lines.push(`Tool: \`${request.toolName}\``);
+        } else if (request.kind === "url") {
+            lines.push(`Type: URL access`);
+            if (request.url) lines.push(`URL: \`${request.url}\``);
+        } else {
+            lines.push(`Type: ${request.kind}`);
+        }
+
+        lines.push("", "Reply **yes** or **no** (or respond in terminal)");
+
+        const promptText = lines.join("\n");
+
+        return new Promise((resolve) => {
+            const chatIds = getAllowedChatIds();
+            const chunks = chunkMessage(promptText);
+            for (const chatId of chatIds) {
+                // Send all chunks except the last as plain formatted messages
+                for (let i = 0; i < chunks.length - 1; i++) {
+                    enqueue(() => sendFormattedMessage(chatId, chunks[i]));
+                }
+                // Send the last chunk with inline keyboard buttons
+                const lastChunk = chunks[chunks.length - 1];
+                const html = markdownToTelegramHtml(lastChunk);
+                enqueue(() => callTelegram("sendMessage", {
+                    chat_id: chatId,
+                    text: html,
+                    parse_mode: "HTML",
+                    reply_markup: JSON.stringify({
+                        inline_keyboard: [[
+                            { text: "✅ Allow", callback_data: "perm_allow" },
+                            { text: "❌ Deny", callback_data: "perm_deny" }
+                        ]]
+                    })
+                }).catch(() => sendFormattedMessage(chatId, lastChunk)));
+            }
+
+            const timer = setTimeout(() => {
+                if (awaitingPermission && awaitingPermission.timer === timer) {
+                    awaitingPermission = null;
+                }
+                // Fall through to terminal prompt
+                resolve({ kind: "no-result" });
+            }, ASK_USER_TIMEOUT_MS);
+
+            awaitingPermission = {
+                resolve: (result) => {
+                    // Notify Telegram of the decision
+                    const emoji = result.kind === "approved" ? "✅" : "❌";
+                    const chatIds = getAllowedChatIds();
+                    for (const chatId of chatIds) {
+                        enqueue(() => sendMessage(chatId, `${emoji} Permission ${result.kind === "approved" ? "granted" : "denied"}.`));
+                    }
+                    resolve(result);
+                },
+                timer,
+            };
+        });
+    };
 }
 
 // ============================================================
@@ -767,12 +1062,20 @@ function setupEventHandlers(sess) {
     if (eventHandlersRegistered) return;
     eventHandlersRegistered = true;
 
+    // Deduplicate assistant messages (SDK may fire the event more than once)
+    let lastMessageHash = null;
+
     sess.on("assistant.message", (event) => {
         if (!connected) return;
         if (event.data.parentToolCallId) return;
 
         const content = event.data.content;
         if (!content || content.trim().length === 0) return;
+
+        // Skip if we just sent this exact message
+        const hash = content.length + ":" + content.slice(0, 100);
+        if (hash === lastMessageHash) return;
+        lastMessageHash = hash;
 
         resetTypingDebounce();
 
@@ -818,8 +1121,36 @@ function setupEventHandlers(sess) {
         const toolName = event.data.toolName || "unknown";
         const desc = describeToolCall(toolName, event.data.arguments);
         if (desc) {
-            activeTools.set(toolCallId, { name: toolName, description: desc });
+            activeTools.set(toolCallId, { name: toolName, description: desc, args: event.data.arguments });
             scheduleBubbleUpdate();
+        }
+
+        // Forward ask_user prompts to Telegram
+        if (toolName === "ask_user") {
+            const args = event.data.arguments || {};
+            const rendered = renderAskUserPrompt(args);
+            const chatIds = getAllowedChatIds();
+            const chunks = chunkMessage(rendered);
+            for (const chatId of chatIds) {
+                for (const chunk of chunks) {
+                    enqueue(() => sendFormattedMessage(chatId, chunk));
+                }
+            }
+        }
+
+        // Forward task_complete summary to Telegram
+        if (toolName === "task_complete") {
+            const summary = event.data.arguments?.summary;
+            if (summary) {
+                const chatIds = getAllowedChatIds();
+                const header = "✅ **Task Complete**\n\n" + summary;
+                const chunks = chunkMessage(header);
+                for (const chatId of chatIds) {
+                    for (const chunk of chunks) {
+                        enqueue(() => sendFormattedMessage(chatId, chunk));
+                    }
+                }
+            }
         }
     });
 
@@ -833,6 +1164,33 @@ function setupEventHandlers(sess) {
         }
         activeTools.delete(toolCallId);
         scheduleBubbleUpdate();
+
+        // Diff rendering for edit/create tools
+        if (completed?.name === "edit" && completed.args) {
+            const path = completed.args.path || "unknown";
+            const shortPath = path.split(/[/\\]/).slice(-2).join("/");
+            const lines = [`📝 \`${shortPath}\``];
+            if (completed.args.old_str && completed.args.new_str) {
+                const oldLines = completed.args.old_str.split("\n").slice(0, 3);
+                const newLines = completed.args.new_str.split("\n").slice(0, 3);
+                lines.push("```");
+                oldLines.forEach(l => lines.push(`- ${l}`));
+                newLines.forEach(l => lines.push(`+ ${l}`));
+                if (completed.args.old_str.split("\n").length > 3) lines.push("...");
+                lines.push("```");
+            }
+            const chatIds = getAllowedChatIds();
+            for (const chatId of chatIds) {
+                enqueue(() => sendFormattedMessage(chatId, lines.join("\n")));
+            }
+        } else if (completed?.name === "create" && completed.args) {
+            const path = completed.args.path || "unknown";
+            const shortPath = path.split(/[/\\]/).slice(-2).join("/");
+            const chatIds = getAllowedChatIds();
+            for (const chatId of chatIds) {
+                enqueue(() => sendFormattedMessage(chatId, `📄 Created: \`${shortPath}\``));
+            }
+        }
 
         const contents = event.data.result?.contents;
         if (!contents || !Array.isArray(contents)) return;
@@ -867,12 +1225,44 @@ function setupEventHandlers(sess) {
 function createUserInputHandler() {
     return (request) => {
         return new Promise((resolve) => {
-            let questionText = request.question;
-            if (request.choices && request.choices.length > 0) {
+            let questionText = request.question || request.message || "Input needed:";
+
+            // Render requestedSchema properties as numbered choices or field prompts
+            if (request.requestedSchema?.properties) {
+                const props = request.requestedSchema.properties;
+                const lines = [questionText, ""];
+                for (const [key, field] of Object.entries(props)) {
+                    const label = field.title || key;
+                    if (field.enum && field.enum.length > 0) {
+                        // Enum field — show as numbered choices
+                        const names = field.enumNames || field.enum;
+                        lines.push(`${label}:`);
+                        names.forEach((name, i) => {
+                            const marker = field.default === field.enum[i] ? " ✓" : "";
+                            lines.push(`  ${i + 1}) ${name}${marker}`);
+                        });
+                    } else if (field.oneOf && field.oneOf.length > 0) {
+                        lines.push(`${label}:`);
+                        field.oneOf.forEach((opt, i) => {
+                            const marker = field.default === opt.const ? " ✓" : "";
+                            lines.push(`  ${i + 1}) ${opt.title || opt.const}${marker}`);
+                        });
+                    } else if (field.type === "boolean") {
+                        const def = field.default != null ? ` (default: ${field.default ? "yes" : "no"})` : "";
+                        lines.push(`${label}: yes/no${def}`);
+                    } else {
+                        const def = field.default != null ? ` (default: ${field.default})` : "";
+                        lines.push(`${label}${def}`);
+                    }
+                    if (field.description) lines.push(`  → ${field.description}`);
+                }
+                lines.push("", "Reply with your choice (number or text):");
+                questionText = lines.join("\n");
+            } else if (request.choices && request.choices.length > 0) {
                 const choiceList = request.choices
                     .map((c, i) => `${i + 1}) ${c}`)
                     .join("\n");
-                questionText = `${request.question}\n${choiceList}`;
+                questionText = `${questionText}\n${choiceList}`;
             }
 
             const chatIds = getAllowedChatIds();
@@ -895,7 +1285,31 @@ function createUserInputHandler() {
                     let answer = rawText;
                     let wasFreeform = true;
 
-                    if (request.choices && request.choices.length > 0) {
+                    // Try to match against schema enum/oneOf choices
+                    if (request.requestedSchema?.properties) {
+                        const props = request.requestedSchema.properties;
+                        for (const [, field] of Object.entries(props)) {
+                            const options = field.enum || (field.oneOf ? field.oneOf.map(o => o.const) : null);
+                            const labels = field.enumNames || (field.oneOf ? field.oneOf.map(o => o.title || o.const) : null);
+                            if (options) {
+                                const num = parseInt(rawText.trim(), 10);
+                                if (!isNaN(num) && num >= 1 && num <= options.length) {
+                                    answer = options[num - 1];
+                                    wasFreeform = false;
+                                    break;
+                                }
+                                const match = (labels || options).find(
+                                    c => c.toLowerCase() === rawText.trim().toLowerCase()
+                                );
+                                if (match) {
+                                    const idx = (labels || options).indexOf(match);
+                                    answer = options[idx] ?? match;
+                                    wasFreeform = false;
+                                    break;
+                                }
+                            }
+                        }
+                    } else if (request.choices && request.choices.length > 0) {
                         const num = parseInt(rawText.trim(), 10);
                         if (!isNaN(num) && num >= 1 && num <= request.choices.length) {
                             answer = request.choices[num - 1];
@@ -1004,6 +1418,7 @@ async function handleConnect(name, sessionId) {
     setupEventHandlers(session);
 
     connected = true;
+    lastCompletedToolDesc = null;
 
     const chatIds = getAllowedChatIds();
 
@@ -1017,13 +1432,29 @@ async function handleConnect(name, sessionId) {
             `4. Send that code to @${botInfo.username} in Telegram to complete pairing`
         );
     } else {
+        // Build session status message
+        let branchName = "unknown";
+        try {
+            branchName = execSync("git rev-parse --abbrev-ref HEAD", { encoding: "utf-8", timeout: 5000 }).trim();
+        } catch {}
+        const workDir = process.env.COPILOT_CWD || process.cwd();
+        const shortSession = sessionId.slice(0, 8);
+        const displayName = name;
+        const botUsername = botInfo.username;
+        const statusMsg =
+            `🟢 Connected\n` +
+            `Bot: ${displayName} (@${botUsername})\n` +
+            `Branch: ${branchName}\n` +
+            `Dir: ${workDir}\n` +
+            `Session: ${shortSession}`;
+
         if (tookOverFrom) {
             await session.log(`Took over bot '${name}' from session ${tookOverFrom}. Telegram bridge connected (@${botInfo.username}).`);
         } else {
             await session.log(`Telegram bridge connected (@${botInfo.username}).`);
-            for (const chatId of chatIds) {
-                enqueue(() => sendMessage(chatId, "Copilot CLI session connected."));
-            }
+        }
+        for (const chatId of chatIds) {
+            enqueue(() => sendMessage(chatId, statusMsg));
         }
     }
 
@@ -1061,6 +1492,7 @@ async function handleDisconnect(sessionId) {
 
     // 5. Mark disconnected and release lock
     connected = false;
+    eventHandlersRegistered = false;
     if (currentBotName) removeLock(currentBotName, sessionId);
 
     // 6. Clear all bot-specific state
@@ -1179,37 +1611,33 @@ async function handleTelegramCommand(args, sessionId) {
         case "remove":
             await handleRemove(botName, sessionId);
             break;
+        case "help":
+            await session.log(
+                "/telegram help — Telegram Bridge commands:\n" +
+                "  setup <name>       Register a new bot (you'll be prompted for the token)\n" +
+                "  connect <name>     Start polling with a registered bot\n" +
+                "  disconnect         Stop the active polling loop\n" +
+                "  status             Show registered bots and connection state\n" +
+                "  remove <name>      Unregister a bot and delete its stored token"
+            );
+            break;
         default:
-            await session.log("Available: /telegram setup|connect|disconnect|status|remove");
+            await session.log("Unknown subcommand. Run /telegram help for usage.");
             break;
     }
 }
 
-// Register /telegram as an SDK slash command via the wire protocol.
-// The SDK's joinSession doesn't expose the `commands` parameter, so we
-// send a follow-up session.resume with just the commands field. The server
-// merges this additively -- undefined fields are skipped.
-async function registerSlashCommand(sess) {
-    const commands = [{ name: "telegram", description: "Telegram bridge: setup, connect, disconnect, status, remove" }];
-    // Must include hooks:true to preserve hook registrations from joinSession.
-    // Without it, the server treats this as enableHooksCallback:false and removes
-    // the ad-hoc hooks that were just registered.
-    await sess.connection.sendRequest("session.resume", {
-        sessionId: sess.sessionId,
-        commands,
-        hooks: true,
-    });
-
-    sess.on("command.execute", (event) => {
-        const { requestId, commandName, args } = event.data;
-        if (commandName !== "telegram") return;
-        handleTelegramCommand(args, sess.sessionId)
-            .then(() => sess.rpc.commands.handlePendingCommand({ requestId }))
-            .catch(err => {
-                console.error("telegram-bridge: command error:", err.message);
-                sess.rpc.commands.handlePendingCommand({ requestId, error: err.message });
-            });
-    });
+// Build the /telegram command definition for use with joinSession's `commands` option.
+// Passing commands directly to joinSession registers them atomically with the session,
+// avoiding the race where the CLI resolves the command before a follow-up session.resume.
+function buildTelegramCommand() {
+    return {
+        name: "telegram",
+        description: "Telegram bridge: setup, connect, disconnect, status, remove",
+        handler: async (context) => {
+            await handleTelegramCommand(context.args, context.sessionId);
+        },
+    };
 }
 
 // ============================================================
@@ -1251,6 +1679,7 @@ async function pollLoop() {
                 try { await dismissBubble(); } catch {}
 
                 connected = false;
+                eventHandlersRegistered = false;
                 if (currentBotName && currentSessionId) removeLock(currentBotName, currentSessionId);
 
                 const lostBotName = currentBotName;
@@ -1285,6 +1714,8 @@ async function main() {
 
     session = await joinSession({
         onUserInputRequest: createUserInputHandler(),
+        onPermissionRequest: createPermissionHandler(),
+        commands: [buildTelegramCommand()],
         hooks: {
             onUserPromptSubmitted: (input) => {
                 if (!pendingSetupName) return;
@@ -1337,13 +1768,39 @@ async function main() {
         },
     });
 
-    await registerSlashCommand(session);
-
-    const botCount = Object.keys(registry).length;
-    if (botCount === 0) {
+    const botNames = Object.keys(registry);
+    if (botNames.length === 0) {
         await session.log("Telegram bridge: no bots registered. Type /telegram setup <name> to add one.");
     } else {
-        await session.log(`Telegram bridge: dormant (${botCount} bot(s) registered). Type /telegram connect <name> to start.`);
+        // Auto-connect: find a bot whose lock is stale or belongs to this session
+        let autoBot = null;
+        if (botNames.length === 1) {
+            // Single bot: auto-connect unless another live session owns it
+            const lock = readLock(botNames[0]);
+            if (!lock || isLockStale(lock) || lock.sessionId === session.sessionId) {
+                autoBot = botNames[0];
+            }
+        } else {
+            // Multiple bots: auto-connect to first bot with no lock or a stale lock
+            for (const name of botNames) {
+                const lock = readLock(name);
+                if (!lock || isLockStale(lock)) {
+                    autoBot = name;
+                    break;
+                }
+            }
+        }
+
+        if (autoBot) {
+            await session.log(`Telegram bridge: auto-connecting to '${autoBot}'...`);
+            try {
+                await handleConnect(autoBot, session.sessionId);
+            } catch (err) {
+                console.error("telegram-bridge: auto-connect failed:", err.message);
+            }
+        } else {
+            await session.log(`Telegram bridge: dormant (${botNames.length} bot(s) registered). Type /telegram connect <name> to start.`);
+        }
     }
 }
 
