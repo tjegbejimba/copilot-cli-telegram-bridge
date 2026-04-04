@@ -407,7 +407,6 @@ let session;
 let abortController;
 let shutdownRequested = false;
 let awaitingInput = null;
-let awaitingPermission = null;
 let connected = false;
 let compactMode = false;
 
@@ -943,57 +942,6 @@ function renderAskUserPrompt(args) {
 // Section 9c: Permission request handler for Telegram
 // ============================================================
 
-function createPermissionHandler() {
-    return (request) => {
-        if (!connected) return { kind: "no-result" };
-
-        // If a Telegram user already answered (via callback button), use that
-        if (awaitingPermission?.resolved) {
-            const result = awaitingPermission.result;
-            awaitingPermission = null;
-            return result;
-        }
-
-        // Otherwise, send notification to Telegram and fall through to terminal immediately
-        const lines = ["🔐 **Permission requested**", ""];
-
-        if (request.kind === "shell") {
-            lines.push(`Type: Shell command`);
-            if (request.fullCommandText) {
-                lines.push(`Command: \`${request.fullCommandText}\``);
-            }
-        } else if (request.kind === "write") {
-            lines.push(`Type: File write`);
-            if (request.path) lines.push(`Path: \`${request.path}\``);
-        } else if (request.kind === "read") {
-            lines.push(`Type: File read`);
-            if (request.path) lines.push(`Path: \`${request.path}\``);
-        } else if (request.kind === "mcp") {
-            lines.push(`Type: MCP tool`);
-            if (request.toolName) lines.push(`Tool: \`${request.toolName}\``);
-        } else if (request.kind === "url") {
-            lines.push(`Type: URL access`);
-            if (request.url) lines.push(`URL: \`${request.url}\``);
-        } else {
-            lines.push(`Type: ${request.kind}`);
-        }
-
-        lines.push("", "Respond in terminal ↩️");
-
-        const promptText = lines.join("\n");
-        const chatIds = getAllowedChatIds();
-        const chunks = chunkMessage(promptText);
-        for (const chatId of chatIds) {
-            for (const chunk of chunks) {
-                enqueue(() => sendFormattedMessage(chatId, chunk));
-            }
-        }
-
-        // Return immediately — terminal handles the actual approval
-        return { kind: "no-result" };
-    };
-}
-
 // ============================================================
 // Section 10: Event Handlers (outbound to Telegram)
 // ============================================================
@@ -1003,6 +951,36 @@ let eventHandlersRegistered = false;
 function setupEventHandlers(sess) {
     if (eventHandlersRegistered) return;
     eventHandlersRegistered = true;
+
+    // Forward permission prompts to Telegram (only fires when CLI actually shows a prompt)
+    sess.on("permission.requested", (event) => {
+        if (!connected) return;
+        const req = event.data.permissionRequest || event.data;
+        const lines = ["🔐 **Permission requested**", ""];
+
+        if (req.kind === "shell") {
+            lines.push(`Type: Shell command`);
+            if (req.fullCommandText) lines.push(`Command: \`${req.fullCommandText}\``);
+        } else if (req.kind === "write") {
+            lines.push(`Type: File write`);
+            if (req.path) lines.push(`Path: \`${req.path}\``);
+        } else if (req.kind === "read") {
+            lines.push(`Type: File read`);
+            if (req.path) lines.push(`Path: \`${req.path}\``);
+        } else if (req.kind === "mcp") {
+            lines.push(`Type: MCP tool`);
+        } else if (req.kind === "url") {
+            lines.push(`Type: URL access`);
+        } else {
+            lines.push(`Type: ${req.kind || "unknown"}`);
+        }
+        lines.push("", "Respond in terminal ↩️");
+
+        const chatIds = getAllowedChatIds();
+        for (const chatId of chatIds) {
+            enqueue(() => sendFormattedMessage(chatId, lines.join("\n")));
+        }
+    });
 
     // Deduplicate assistant messages (SDK may fire the event more than once)
     let lastMessageHash = null;
@@ -1656,7 +1634,6 @@ async function main() {
 
     session = await joinSession({
         onUserInputRequest: createUserInputHandler(),
-        onPermissionRequest: createPermissionHandler(),
         commands: [buildTelegramCommand()],
         hooks: {
             onUserPromptSubmitted: (input) => {
