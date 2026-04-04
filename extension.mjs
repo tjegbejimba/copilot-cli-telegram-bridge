@@ -771,7 +771,31 @@ async function processUpdate(update) {
         enqueue(() => callTelegram("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {}));
 
         if (cbChatId != null && cbUserId != null && isAllowed(cbUserIdStr)) {
-            // Callback buttons can be extended here for future features
+            // Handle permission inline keyboard buttons
+            if (cbData && cbData.startsWith("perm_")) {
+                const [action, reqId] = cbData.split(":");
+                if (reqId) {
+                    const approved = action === "perm_allow";
+                    const result = approved
+                        ? { kind: "approved" }
+                        : { kind: "denied-by-rules", rules: [] };
+
+                    // Respond to the permission via SDK
+                    sess.rpc.permissions.handlePendingPermissionRequest({
+                        requestId: reqId,
+                        result,
+                    }).catch(err => console.error("telegram-bridge: permission response failed:", err.message));
+
+                    // Edit the message to show the decision
+                    const decisionText = approved ? "✅ Permission granted" : "❌ Permission denied";
+                    enqueue(() => callTelegram("editMessageText", {
+                        chat_id: cbChatId,
+                        message_id: cbq.message?.message_id,
+                        text: decisionText,
+                    }).catch(() => {}));
+                }
+                return;
+            }
         }
         // Unknown callback data — ignore
         return;
@@ -957,6 +981,7 @@ function setupEventHandlers(sess) {
     // permission.requested — if permission.completed arrives before then,
     // it was auto-approved and we skip the notification.
     const pendingPermissions = new Map(); // requestId → timer
+    let activePermissionRequestId = null; // requestId of the permission currently shown on Telegram
 
     sess.on("permission.requested", (event) => {
         if (!connected) return;
@@ -965,8 +990,10 @@ function setupEventHandlers(sess) {
 
         const timer = setTimeout(() => {
             pendingPermissions.delete(requestId);
+            activePermissionRequestId = requestId;
+
             // Still pending after 1.5s — this is a real user prompt
-            const lines = ["🔐 **Permission needed in terminal**", ""];
+            const lines = ["🔐 **Permission needed**", ""];
             if (req.kind === "shell" && req.fullCommandText) {
                 lines.push(`Command: \`${req.fullCommandText}\``);
             } else if ((req.kind === "write" || req.kind === "read") && req.fileName) {
@@ -974,9 +1001,21 @@ function setupEventHandlers(sess) {
             } else {
                 lines.push(`Type: ${req.kind || "unknown"}`);
             }
+
             const chatIds = getAllowedChatIds();
+            const html = markdownToTelegramHtml(lines.join("\n"));
             for (const chatId of chatIds) {
-                enqueue(() => sendFormattedMessage(chatId, lines.join("\n")));
+                enqueue(() => callTelegram("sendMessage", {
+                    chat_id: chatId,
+                    text: html,
+                    parse_mode: "HTML",
+                    reply_markup: JSON.stringify({
+                        inline_keyboard: [[
+                            { text: "✅ Allow", callback_data: `perm_allow:${requestId}` },
+                            { text: "❌ Deny", callback_data: `perm_deny:${requestId}` }
+                        ]]
+                    })
+                }).catch(() => sendFormattedMessage(chatId, lines.join("\n"))));
             }
         }, 1500);
 
@@ -985,6 +1024,9 @@ function setupEventHandlers(sess) {
 
     sess.on("permission.completed", (event) => {
         const requestId = event.data.requestId;
+        if (requestId === activePermissionRequestId) {
+            activePermissionRequestId = null;
+        }
         const timer = pendingPermissions.get(requestId);
         if (timer) {
             clearTimeout(timer);
