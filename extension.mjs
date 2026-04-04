@@ -408,6 +408,7 @@ let abortController;
 let shutdownRequested = false;
 let awaitingInput = null;
 let connected = false;
+let lastTelegramPrompts = new Set(); // track prompts sent from Telegram to avoid echo
 let compactMode = false;
 
 let botInfo = null;
@@ -914,6 +915,7 @@ async function processUpdate(update) {
     }
 
     if (text) {
+        lastTelegramPrompts.add(text);
         await session.send({ prompt: text });
         return;
     }
@@ -1031,6 +1033,29 @@ function setupEventHandlers(sess) {
         if (timer) {
             clearTimeout(timer);
             pendingPermissions.delete(requestId);
+        }
+    });
+
+    // Forward CLI terminal input to Telegram (so mobile user can follow along)
+    sess.on("user.message", (event) => {
+        if (!connected) return;
+        const content = event.data.content;
+        if (!content || content.trim().length === 0) return;
+
+        // Skip if this message originated from Telegram (avoid echo)
+        if (lastTelegramPrompts.has(content)) {
+            lastTelegramPrompts.delete(content);
+            return;
+        }
+
+        // Show as "You (terminal):" in a distinct style
+        const chatIds = getAllowedChatIds();
+        const display = `💬 **You:** ${content}`;
+        const chunks = chunkMessage(display);
+        for (const chatId of chatIds) {
+            for (const chunk of chunks) {
+                enqueue(() => sendFormattedMessage(chatId, chunk));
+            }
         }
     });
 
