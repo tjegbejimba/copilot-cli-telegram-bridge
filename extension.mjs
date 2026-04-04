@@ -1043,7 +1043,7 @@ function setupEventHandlers(sess) {
                     })
                 }).catch(() => sendFormattedMessage(chatId, lines.join("\n"))));
             }
-        }, 1500);
+        }, 5000);
 
         pendingPermissions.set(requestId, timer);
     });
