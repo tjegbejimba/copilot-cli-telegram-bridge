@@ -415,6 +415,12 @@ let botInfo = null;
 let currentSessionId = null;
 let currentBotName = null;
 
+// Session statistics (Feature 1: Session Summary)
+let sessionStats = { toolCalls: 0, filesEdited: new Set(), filesCreated: new Set(), connectedAt: null };
+
+// Message batching (Feature 2: Smart Notification Batching)
+let messageBatch = { content: "", timer: null };
+
 // ============================================================
 // Section 5b: Lock File Management
 // ============================================================
@@ -974,6 +980,24 @@ function renderAskUserPrompt(args) {
 
 let eventHandlersRegistered = false;
 
+function flushMessageBatch() {
+    if (messageBatch.timer) {
+        clearTimeout(messageBatch.timer);
+        messageBatch.timer = null;
+    }
+    const content = messageBatch.content;
+    messageBatch.content = "";
+    if (!content || content.trim().length === 0) return;
+
+    const chatIds = getAllowedChatIds();
+    const chunks = chunkMessage(content);
+    for (const chatId of chatIds) {
+        for (const chunk of chunks) {
+            enqueue(() => sendFormattedMessage(chatId, chunk));
+        }
+    }
+}
+
 function setupEventHandlers(sess) {
     if (eventHandlersRegistered) return;
     eventHandlersRegistered = true;
@@ -1076,13 +1100,14 @@ function setupEventHandlers(sess) {
 
         resetTypingDebounce();
 
-        const chatIds = getAllowedChatIds();
-        const chunks = chunkMessage(content);
-        for (const chatId of chatIds) {
-            for (const chunk of chunks) {
-                enqueue(() => sendFormattedMessage(chatId, chunk));
-            }
+        // Batch messages arriving within 500ms
+        if (messageBatch.content.length > 0) {
+            messageBatch.content += "\n\n" + content;
+        } else {
+            messageBatch.content = content;
         }
+        if (messageBatch.timer) clearTimeout(messageBatch.timer);
+        messageBatch.timer = setTimeout(() => flushMessageBatch(), 500);
     });
 
     sess.on("assistant.message_delta", (event) => {
@@ -1094,14 +1119,22 @@ function setupEventHandlers(sess) {
 
     sess.on("session.error", (event) => {
         if (!connected) return;
-        const errMsg = `Error: ${event.data.message || event.data.errorType || "Unknown error"}`;
+        const errorType = event.data.errorType || "Unknown";
+        const message = event.data.message || "Unknown error";
+        const stack = event.data.stack || "";
+        let errMsg = `❗ **Error**\n\n\`${errorType}\`: ${message}`;
+        if (stack) {
+            const truncatedStack = stack.slice(0, 500);
+            errMsg += `\n\n\`\`\`\n${truncatedStack}\n\`\`\``;
+        }
         const chatIds = getAllowedChatIds();
         for (const chatId of chatIds) {
-            enqueue(() => sendMessage(chatId, errMsg));
+            enqueue(() => sendFormattedMessage(chatId, errMsg));
         }
     });
 
     sess.on("session.idle", () => {
+        flushMessageBatch();
         stopTyping();
         dismissBubble();
     });
@@ -1114,6 +1147,7 @@ function setupEventHandlers(sess) {
         if (!connected) return;
         resetTypingDebounce();
         bubbleActive = true;
+        sessionStats.toolCalls++;
         const toolCallId = event.data.toolCallId;
         const toolName = event.data.toolName || "unknown";
         const desc = describeToolCall(toolName, event.data.arguments);
@@ -1161,6 +1195,13 @@ function setupEventHandlers(sess) {
         }
         activeTools.delete(toolCallId);
         scheduleBubbleUpdate();
+
+        // Track files for session summary
+        if (completed?.name === "edit" && completed.args?.path) {
+            sessionStats.filesEdited.add(completed.args.path);
+        } else if (completed?.name === "create" && completed.args?.path) {
+            sessionStats.filesCreated.add(completed.args.path);
+        }
 
         // Diff rendering for edit/create tools
         if (completed?.name === "edit" && completed.args) {
@@ -1416,6 +1457,7 @@ async function handleConnect(name, sessionId) {
 
     connected = true;
     lastCompletedToolDesc = null;
+    sessionStats = { toolCalls: 0, filesEdited: new Set(), filesCreated: new Set(), connectedAt: new Date() };
 
     const chatIds = getAllowedChatIds();
 
@@ -1475,24 +1517,44 @@ async function handleDisconnect(sessionId) {
         try { saveJsonAtomic(botStatePath(currentBotName), state); } catch {}
     }
 
-    // 3. Goodbye messages (needs botToken) -- collect promises so we can await drain
+    // 3. Session summary (send before goodbye)
     const chatIds = getAllowedChatIds();
+    if (sessionStats.connectedAt) {
+        const durationMs = Date.now() - sessionStats.connectedAt.getTime();
+        const totalMinutes = Math.floor(durationMs / 60000);
+        const hours = Math.floor(totalMinutes / 60);
+        const minutes = totalMinutes % 60;
+        const durationStr = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+        const summaryMsg =
+            `📊 Session Summary\n` +
+            `Duration: ${durationStr}\n` +
+            `Tool calls: ${sessionStats.toolCalls}\n` +
+            `Files edited: ${sessionStats.filesEdited.size}\n` +
+            `Files created: ${sessionStats.filesCreated.size}`;
+        const summaryPromises = [];
+        for (const chatId of chatIds) {
+            summaryPromises.push(enqueue(() => sendMessage(chatId, summaryMsg).catch(() => {})));
+        }
+        await Promise.race([Promise.allSettled(summaryPromises), sleep(3000)]);
+    }
+
+    // 4. Goodbye messages (needs botToken) -- collect promises so we can await drain
     const goodbyePromises = [];
     for (const chatId of chatIds) {
         goodbyePromises.push(enqueue(() => sendMessage(chatId, "Copilot CLI session disconnected.").catch(() => {})));
     }
     await Promise.race([Promise.allSettled(goodbyePromises), sleep(3000)]);
 
-    // 4. Stop typing and dismiss bubble (need botToken for API calls)
+    // 5. Stop typing and dismiss bubble (need botToken for API calls)
     stopTyping();
     await dismissBubble();
 
-    // 5. Mark disconnected and release lock
+    // 6. Mark disconnected and release lock
     connected = false;
     eventHandlersRegistered = false;
     if (currentBotName) removeLock(currentBotName, sessionId);
 
-    // 6. Clear all bot-specific state
+    // 7. Clear all bot-specific state
     botToken = null;
     botInfo = null;
     currentBotName = null;
