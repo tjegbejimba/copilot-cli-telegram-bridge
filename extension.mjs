@@ -952,36 +952,6 @@ function setupEventHandlers(sess) {
     if (eventHandlersRegistered) return;
     eventHandlersRegistered = true;
 
-    // Forward permission prompts to Telegram (only fires when CLI actually shows a prompt)
-    sess.on("permission.requested", (event) => {
-        if (!connected) return;
-        const req = event.data.permissionRequest || event.data;
-        const lines = ["🔐 **Permission requested**", ""];
-
-        if (req.kind === "shell") {
-            lines.push(`Type: Shell command`);
-            if (req.fullCommandText) lines.push(`Command: \`${req.fullCommandText}\``);
-        } else if (req.kind === "write") {
-            lines.push(`Type: File write`);
-            if (req.path) lines.push(`Path: \`${req.path}\``);
-        } else if (req.kind === "read") {
-            lines.push(`Type: File read`);
-            if (req.path) lines.push(`Path: \`${req.path}\``);
-        } else if (req.kind === "mcp") {
-            lines.push(`Type: MCP tool`);
-        } else if (req.kind === "url") {
-            lines.push(`Type: URL access`);
-        } else {
-            lines.push(`Type: ${req.kind || "unknown"}`);
-        }
-        lines.push("", "Respond in terminal ↩️");
-
-        const chatIds = getAllowedChatIds();
-        for (const chatId of chatIds) {
-            enqueue(() => sendFormattedMessage(chatId, lines.join("\n")));
-        }
-    });
-
     // Deduplicate assistant messages (SDK may fire the event more than once)
     let lastMessageHash = null;
 
