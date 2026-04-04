@@ -422,7 +422,7 @@ let abortController;
 let shutdownRequested = false;
 let awaitingInput = null;
 let connected = false;
-let lastTelegramPrompts = new Set(); // track prompts sent from Telegram to avoid echo
+let lastTelegramPrompts = null; // timestamp of last Telegram-originated prompt
 let compactMode = false;
 
 let botInfo = null;
@@ -935,7 +935,7 @@ async function processUpdate(update) {
     }
 
     if (text) {
-        lastTelegramPrompts.add(text);
+        lastTelegramPrompts = Date.now();
         await session.send({ prompt: text });
         return;
     }
@@ -1081,8 +1081,9 @@ function setupEventHandlers(sess) {
         if (!content || content.trim().length === 0) return;
 
         // Skip if this message originated from Telegram (avoid echo)
-        if (lastTelegramPrompts.has(content)) {
-            lastTelegramPrompts.delete(content);
+        // If a Telegram prompt was sent within the last 2 seconds, this user.message is the echo
+        if (lastTelegramPrompts && (Date.now() - lastTelegramPrompts) < 2000) {
+            lastTelegramPrompts = null;
             return;
         }
 
