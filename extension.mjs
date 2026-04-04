@@ -1074,7 +1074,7 @@ function setupEventHandlers(sess) {
 
         // Show as "You (terminal):" in a distinct style
         const chatIds = getAllowedChatIds();
-        const display = `💬 **You:** ${content}`;
+        const display = `👨🏿‍💻 **You:** ${content}`;
         const chunks = chunkMessage(display);
         for (const chatId of chatIds) {
             for (const chunk of chunks) {
