@@ -772,23 +772,7 @@ async function processUpdate(update) {
         enqueue(() => callTelegram("answerCallbackQuery", { callback_query_id: cbq.id }).catch(() => {}));
 
         if (cbChatId != null && cbUserId != null && isAllowed(cbUserIdStr)) {
-            if (awaitingPermission && (cbData === "perm_allow" || cbData === "perm_deny")) {
-                const approved = cbData === "perm_allow";
-                const { resolve } = awaitingPermission;
-                clearTimeout(awaitingPermission.timer);
-                awaitingPermission = null;
-
-                // Edit the original permission message to show the decision
-                const decisionText = approved ? "✅ Permission granted" : "❌ Permission denied";
-                enqueue(() => callTelegram("editMessageText", {
-                    chat_id: cbChatId,
-                    message_id: cbq.message.message_id,
-                    text: decisionText,
-                }).catch(() => {}));
-
-                resolve(approved ? { kind: "approved" } : { kind: "denied-by-rules", rules: [] });
-                return;
-            }
+            // Callback buttons can be extended here for future features
         }
         // Unknown callback data — ignore
         return;
@@ -813,20 +797,6 @@ async function processUpdate(update) {
         awaitingInput = null;
         resolve(text);
         return;
-    }
-
-    // If awaiting permission response and sender is allowed, resolve (text-based fallback)
-    if (awaitingPermission && isAllowed(userIdStr)) {
-        const lower = text.trim().toLowerCase();
-        const approved = ["yes", "y", "allow", "approve", "ok", "1"].includes(lower);
-        const denied = ["no", "n", "deny", "reject", "0"].includes(lower);
-        if (approved || denied) {
-            const { resolve } = awaitingPermission;
-            clearTimeout(awaitingPermission.timer);
-            awaitingPermission = null;
-            resolve(approved ? { kind: "approved" } : { kind: "denied-by-rules", rules: [] });
-            return;
-        }
     }
 
     if (!isAllowed(userIdStr)) {
@@ -977,6 +947,14 @@ function createPermissionHandler() {
     return (request) => {
         if (!connected) return { kind: "no-result" };
 
+        // If a Telegram user already answered (via callback button), use that
+        if (awaitingPermission?.resolved) {
+            const result = awaitingPermission.result;
+            awaitingPermission = null;
+            return result;
+        }
+
+        // Otherwise, send notification to Telegram and fall through to terminal immediately
         const lines = ["🔐 **Permission requested**", ""];
 
         if (request.kind === "shell") {
@@ -1000,55 +978,19 @@ function createPermissionHandler() {
             lines.push(`Type: ${request.kind}`);
         }
 
-        lines.push("", "Reply **yes** or **no** (or respond in terminal)");
+        lines.push("", "Respond in terminal ↩️");
 
         const promptText = lines.join("\n");
-
-        return new Promise((resolve) => {
-            const chatIds = getAllowedChatIds();
-            const chunks = chunkMessage(promptText);
-            for (const chatId of chatIds) {
-                // Send all chunks except the last as plain formatted messages
-                for (let i = 0; i < chunks.length - 1; i++) {
-                    enqueue(() => sendFormattedMessage(chatId, chunks[i]));
-                }
-                // Send the last chunk with inline keyboard buttons
-                const lastChunk = chunks[chunks.length - 1];
-                const html = markdownToTelegramHtml(lastChunk);
-                enqueue(() => callTelegram("sendMessage", {
-                    chat_id: chatId,
-                    text: html,
-                    parse_mode: "HTML",
-                    reply_markup: JSON.stringify({
-                        inline_keyboard: [[
-                            { text: "✅ Allow", callback_data: "perm_allow" },
-                            { text: "❌ Deny", callback_data: "perm_deny" }
-                        ]]
-                    })
-                }).catch(() => sendFormattedMessage(chatId, lastChunk)));
+        const chatIds = getAllowedChatIds();
+        const chunks = chunkMessage(promptText);
+        for (const chatId of chatIds) {
+            for (const chunk of chunks) {
+                enqueue(() => sendFormattedMessage(chatId, chunk));
             }
+        }
 
-            const timer = setTimeout(() => {
-                if (awaitingPermission && awaitingPermission.timer === timer) {
-                    awaitingPermission = null;
-                }
-                // Fall through to terminal prompt
-                resolve({ kind: "no-result" });
-            }, ASK_USER_TIMEOUT_MS);
-
-            awaitingPermission = {
-                resolve: (result) => {
-                    // Notify Telegram of the decision
-                    const emoji = result.kind === "approved" ? "✅" : "❌";
-                    const chatIds = getAllowedChatIds();
-                    for (const chatId of chatIds) {
-                        enqueue(() => sendMessage(chatId, `${emoji} Permission ${result.kind === "approved" ? "granted" : "denied"}.`));
-                    }
-                    resolve(result);
-                },
-                timer,
-            };
-        });
+        // Return immediately — terminal handles the actual approval
+        return { kind: "no-result" };
     };
 }
 
