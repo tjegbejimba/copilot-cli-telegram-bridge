@@ -952,6 +952,46 @@ function setupEventHandlers(sess) {
     if (eventHandlersRegistered) return;
     eventHandlersRegistered = true;
 
+    // Permission prompt forwarding: only notify Telegram for prompts that
+    // actually need user input (not auto-approved). We delay 1.5s after
+    // permission.requested — if permission.completed arrives before then,
+    // it was auto-approved and we skip the notification.
+    const pendingPermissions = new Map(); // requestId → timer
+
+    sess.on("permission.requested", (event) => {
+        if (!connected) return;
+        const req = event.data.permissionRequest || event.data;
+        const requestId = event.data.requestId;
+
+        const timer = setTimeout(() => {
+            pendingPermissions.delete(requestId);
+            // Still pending after 1.5s — this is a real user prompt
+            const lines = ["🔐 **Permission needed in terminal**", ""];
+            if (req.kind === "shell" && req.fullCommandText) {
+                lines.push(`Command: \`${req.fullCommandText}\``);
+            } else if ((req.kind === "write" || req.kind === "read") && req.fileName) {
+                lines.push(`${req.kind}: \`${req.fileName}\``);
+            } else {
+                lines.push(`Type: ${req.kind || "unknown"}`);
+            }
+            const chatIds = getAllowedChatIds();
+            for (const chatId of chatIds) {
+                enqueue(() => sendFormattedMessage(chatId, lines.join("\n")));
+            }
+        }, 1500);
+
+        pendingPermissions.set(requestId, timer);
+    });
+
+    sess.on("permission.completed", (event) => {
+        const requestId = event.data.requestId;
+        const timer = pendingPermissions.get(requestId);
+        if (timer) {
+            clearTimeout(timer);
+            pendingPermissions.delete(requestId);
+        }
+    });
+
     // Deduplicate assistant messages (SDK may fire the event more than once)
     let lastMessageHash = null;
 
