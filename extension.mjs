@@ -1072,14 +1072,17 @@ function setupEventHandlers(sess) {
             return;
         }
 
-        // Show as "You (terminal):" in a distinct style
+        // Show as "You (terminal):" in a distinct style, silently (no notification)
         const chatIds = getAllowedChatIds();
         const display = `👨🏿‍💻 **You:** ${content}`;
-        const chunks = chunkMessage(display);
+        const html = markdownToTelegramHtml(display);
         for (const chatId of chatIds) {
-            for (const chunk of chunks) {
-                enqueue(() => sendFormattedMessage(chatId, chunk));
-            }
+            enqueue(() => callTelegram("sendMessage", {
+                chat_id: chatId,
+                text: html,
+                parse_mode: "HTML",
+                disable_notification: true,
+            }).catch(() => sendMessage(chatId, display)));
         }
     });
 
