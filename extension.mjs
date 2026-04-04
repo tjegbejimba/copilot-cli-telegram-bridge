@@ -17,6 +17,7 @@ const EXT_DIR = import.meta.dirname;
 const ACCESS_PATH = join(EXT_DIR, "access.json");
 const BOTS_REGISTRY_PATH = join(EXT_DIR, "bots.json");
 const BOTS_DIR = join(EXT_DIR, "bots");
+const AFFINITY_PATH = join(EXT_DIR, "affinity.json");
 const TMP_DIR = join(tmpdir(), `telegram-bridge-${process.pid}`);
 
 const TELEGRAM_API = "https://api.telegram.org";
@@ -59,6 +60,19 @@ function saveJsonAtomic(filePath, data, mode) {
 function botDir(name) { return join(BOTS_DIR, name); }
 function botStatePath(name) { return join(botDir(name), "state.json"); }
 function botLockPath(name) { return join(botDir(name), "lock.json"); }
+
+// Per-directory bot affinity — remembers which bot was last used in each working directory
+function getAffinity() {
+    const cwd = process.env.COPILOT_CWD || process.cwd();
+    const map = loadJsonOrDefault(AFFINITY_PATH, {});
+    return map[cwd] || null;
+}
+function setAffinity(botName) {
+    const cwd = process.env.COPILOT_CWD || process.cwd();
+    const map = loadJsonOrDefault(AFFINITY_PATH, {});
+    map[cwd] = botName;
+    saveJsonAtomic(AFFINITY_PATH, map);
+}
 
 function chunkMessage(text, maxLen = CHUNK_MAX) {
     const chunks = [];
@@ -1461,6 +1475,7 @@ async function handleConnect(name, sessionId) {
     connected = true;
     lastCompletedToolDesc = null;
     sessionStats = { toolCalls: 0, filesEdited: new Set(), filesCreated: new Set(), connectedAt: new Date() };
+    setAffinity(name);
 
     const chatIds = getAllowedChatIds();
 
@@ -1833,16 +1848,24 @@ async function main() {
     if (botNames.length === 0) {
         await session.log("Telegram bridge: no bots registered. Type /telegram setup <name> to add one.");
     } else {
-        // Auto-connect: find a bot whose lock is stale or belongs to this session
+        // Auto-connect: prefer the bot this directory last used (affinity)
         let autoBot = null;
+        const preferred = getAffinity();
+
         if (botNames.length === 1) {
             // Single bot: auto-connect unless another live session owns it
             const lock = readLock(botNames[0]);
             if (!lock || isLockStale(lock) || lock.sessionId === session.sessionId) {
                 autoBot = botNames[0];
             }
+        } else if (preferred && botNames.includes(preferred)) {
+            // Multiple bots: try the affinity bot first
+            const lock = readLock(preferred);
+            if (!lock || isLockStale(lock)) {
+                autoBot = preferred;
+            }
         } else {
-            // Multiple bots: auto-connect to first bot with no lock or a stale lock
+            // No affinity or affinity bot is busy: find any available
             for (const name of botNames) {
                 const lock = readLock(name);
                 if (!lock || isLockStale(lock)) {
