@@ -788,7 +788,7 @@ async function processUpdate(update) {
                         : { kind: "denied-by-rules", rules: [] };
 
                     // Respond to the permission via SDK
-                    sess.rpc.permissions.handlePendingPermissionRequest({
+                    session.rpc.permissions.handlePendingPermissionRequest({
                         requestId: reqId,
                         result,
                     }).catch(err => console.error("telegram-bridge: permission response failed:", err.message));
