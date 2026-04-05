@@ -107,9 +107,31 @@ function markdownToTelegramHtml(md) {
 
     // Phase 1: Extract protected regions (no markdown processing inside these)
 
-    // Markdown tables: detect lines starting with | and convert to <pre>
+    // Markdown tables: detect lines starting with | and convert to clean aligned <pre>
     t = t.replace(/(?:^\|.+\|[ ]*$\n?)+/gm, (block) => {
-        return hold(`<pre>${escapeHtml(block.trimEnd())}</pre>`);
+        const lines = block.trimEnd().split("\n");
+        // Parse cells from each row
+        const rows = lines.map(line =>
+            line.replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim())
+        );
+        // Filter out separator rows (---) 
+        const dataRows = rows.filter(row => !row.every(c => /^[-:]+$/.test(c)));
+        if (dataRows.length === 0) return hold(`<pre>${escapeHtml(block.trimEnd())}</pre>`);
+        // Calculate column widths
+        const colCount = Math.max(...dataRows.map(r => r.length));
+        const widths = Array.from({ length: colCount }, (_, i) =>
+            Math.max(...dataRows.map(r => (r[i] || "").length))
+        );
+        // Format: header row, separator, data rows
+        const formatted = dataRows.map((row, idx) => {
+            const padded = row.map((cell, i) => (cell || "").padEnd(widths[i] || 0)).join("  ");
+            if (idx === 0) {
+                const sep = widths.map(w => "\u2500".repeat(w)).join("\u2500\u2500");
+                return padded + "\n" + sep;
+            }
+            return padded;
+        }).join("\n");
+        return hold(`<pre>${escapeHtml(formatted)}</pre>`);
     });
 
     // Fenced code blocks: ```lang\ncode\n```
