@@ -107,6 +107,11 @@ function markdownToTelegramHtml(md) {
 
     // Phase 1: Extract protected regions (no markdown processing inside these)
 
+    // Markdown tables: detect lines starting with | and convert to <pre>
+    t = t.replace(/(?:^\|.+\|[ ]*$\n?)+/gm, (block) => {
+        return hold(`<pre>${escapeHtml(block.trimEnd())}</pre>`);
+    });
+
     // Fenced code blocks: ```lang\ncode\n```
     t = t.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
         code = code.replace(/\n$/, "");
