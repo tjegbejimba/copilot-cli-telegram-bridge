@@ -851,13 +851,19 @@ async function processUpdate(update) {
     // Handle /stop command — cancel the current agent turn
     if (text.trim().toLowerCase() === "/stop") {
         try {
-            if (typeof session.cancel === "function") {
-                await session.cancel();
-            } else if (session.connection && typeof session.connection.sendRequest === "function") {
-                await session.connection.sendRequest("session.cancel", { sessionId: session.sessionId });
-            } else {
-                await session.send({ cancel: true });
-            }
+            const cancelTimeout = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("cancel timed out")), 10000)
+            );
+            const cancelAction = (async () => {
+                if (typeof session.cancel === "function") {
+                    await session.cancel();
+                } else if (session.connection && typeof session.connection.sendRequest === "function") {
+                    await session.connection.sendRequest("session.cancel", { sessionId: session.sessionId });
+                } else {
+                    await session.send({ cancel: true });
+                }
+            })();
+            await Promise.race([cancelAction, cancelTimeout]);
         } catch (err) {
             console.error("telegram-bridge: cancel error:", err.message);
         }
@@ -1155,6 +1161,33 @@ function setupEventHandlers(sess) {
         flushMessageBatch();
         stopTyping();
         dismissBubble();
+    });
+
+    // Forward system notifications (agent completions, shell completions)
+    sess.on("system.notification", (event) => {
+        if (!connected) return;
+        if (compactMode) return;
+        const kind = event.data.kind;
+        if (!kind) return;
+
+        let msg = null;
+        if (kind.type === "agent_completed") {
+            const emoji = kind.status === "completed" ? "✅" : "❌";
+            const desc = kind.description || kind.agentType || "agent";
+            msg = `${emoji} Agent ${kind.status}: ${desc}`;
+        } else if (kind.type === "shell_completed") {
+            const code = kind.exitCode != null ? ` (exit ${kind.exitCode})` : "";
+            const desc = kind.description || kind.shellId || "shell";
+            msg = `⚡ Shell completed${code}: ${desc}`;
+        }
+        // Skip agent_idle and shell_detached_completed (noisy)
+
+        if (msg) {
+            const chatIds = getAllowedChatIds();
+            for (const chatId of chatIds) {
+                enqueue(() => sendMessage(chatId, msg));
+            }
+        }
     });
 
     // Relay images and documents from tool results to Telegram
@@ -1471,6 +1504,20 @@ async function handleConnect(name, sessionId) {
 
     access = loadJsonOrDefault(ACCESS_PATH, { allowedUsers: [], pending: {} });
     state = loadJsonOrDefault(botStatePath(name), { offset: 0 });
+
+    // Drain stale messages: skip any updates that arrived while disconnected
+    try {
+        const stale = await getUpdates(state.offset, 0); // non-blocking poll
+        if (stale.length > 0) {
+            const skipped = stale.length;
+            state.offset = stale[stale.length - 1].update_id + 1;
+            saveJsonAtomic(botStatePath(name), state);
+            console.log(`telegram-bridge: skipped ${skipped} stale update(s) from while disconnected`);
+        }
+    } catch (err) {
+        console.warn("telegram-bridge: failed to drain stale updates:", err.message);
+    }
+
     setupEventHandlers(session);
 
     connected = true;
