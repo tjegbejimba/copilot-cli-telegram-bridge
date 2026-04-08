@@ -900,6 +900,37 @@ async function processUpdate(update) {
         return;
     }
 
+    // Handle /status command — return connection info without forwarding to terminal
+    if (text.trim().toLowerCase() === "/status") {
+        const uptime = sessionStats.connectedAt
+            ? (() => {
+                const diff = Date.now() - sessionStats.connectedAt;
+                const hrs = Math.floor(diff / 3600000);
+                const mins = Math.floor((diff % 3600000) / 60000);
+                const secs = Math.floor((diff % 60000) / 1000);
+                return hrs > 0 ? `${hrs}h ${mins}m` : mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+            })()
+            : "N/A";
+        const cwd = process.env.COPILOT_CWD || process.cwd();
+        const lines = [
+            "📡 <b>Telegram Bridge Status</b>",
+            "",
+            `<b>Connected:</b> ${connected ? "✅ Yes" : "❌ No"}`,
+            `<b>Bot:</b> ${currentBotName || "none"}${botInfo?.username ? ` (@${botInfo.username})` : ""}`,
+            `<b>Session ID:</b> <code>${currentSessionId || "N/A"}</code>`,
+            `<b>Uptime:</b> ${uptime}`,
+            `<b>Compact mode:</b> ${compactMode ? "ON" : "OFF"}`,
+            `<b>Working dir:</b> <code>${escapeHtml(cwd)}</code>`,
+            "",
+            `<b>Stats this session:</b>`,
+            `  🔧 Tool calls: ${sessionStats.toolCalls}`,
+            `  ✏️ Files edited: ${sessionStats.filesEdited.size}`,
+            `  📄 Files created: ${sessionStats.filesCreated.size}`,
+        ];
+        await enqueue(() => sendMessage(chatId, lines.join("\n"), "HTML"));
+        return;
+    }
+
     // Ack reaction
     enqueue(() => setMessageReaction(chatId, message.message_id, "\uD83D\uDC40").catch(() => {}));
 

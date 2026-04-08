@@ -1,8 +1,5 @@
-# Sensitive files
+# Sensitive files — contain bot tokens and user IDs
 access.json
 bots.json
+affinity.json
 bots/
-debug.log
-
-# Node
-node_modules/
