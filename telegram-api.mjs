@@ -101,6 +101,10 @@ export function createTelegramApi({
         return callTelegram("getFile", { file_id: fileId });
     }
 
+    function setMyCommands(commands) {
+        return callTelegram("setMyCommands", { commands });
+    }
+
     return {
         callTelegram,
         getMe,
@@ -112,5 +116,6 @@ export function createTelegramApi({
         deleteMessage,
         setMessageReaction,
         getFile,
+        setMyCommands,
     };
 }

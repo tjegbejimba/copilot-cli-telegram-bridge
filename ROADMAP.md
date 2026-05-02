@@ -39,6 +39,10 @@ After install, restart Copilot CLI. The extension auto-connects if exactly 1 bot
 | 19 | Structured Telegram input flow for `ask_user`, user input, and elicitation prompts | SDK |
 | 20 | Early lifecycle/error event capture with `joinSession({ onEvent })` | SDK |
 | 21 | Windows DPAPI-backed bot token storage with legacy plaintext migration | Security |
+| 22 | Telegram command menu registration with `setMyCommands` and `/synccommands` fallback | UX |
+| 23 | Telegram `/help`, `/status`, `/health`, `/disconnect`, `/reconnect`, and safe `/command` pass-through | UX |
+| 24 | Persisted polling health for `/status` and `/health` after reload | Reliability |
+| 25 | Fake Telegram command-router tests for menu sync, routing, session controls, and pass-through allow-listing | Tests |
 
 ---
 
@@ -55,6 +59,7 @@ After install, restart Copilot CLI. The extension auto-connects if exactly 1 bot
 - [x] **Message deduplication** — Skip consecutive identical assistant.message events
 - [x] **Graceful reconnect on network drop** — Detect sustained fetch failures and report recovery
 - [x] **Inline keyboard for ask_user** — Use InlineKeyboardMarkup for enum and boolean choices (same pattern as permissions)
+- [x] **Telegram command surface** — Register bot slash commands, expose `/status` and `/health`, and keep sync failures non-fatal
 
 ### Phase 2: UX Polish
 - [ ] **Message threading** — Use Telegram reply-to to thread tool outputs under the original prompt
@@ -71,6 +76,7 @@ After install, restart Copilot CLI. The extension auto-connects if exactly 1 bot
 - [ ] **Pin important messages** — Auto-pin task_complete summaries and error messages
 - [ ] **Search history** — `/search <query>` to search through past Telegram messages in the session
 - [ ] **Persistent preferences** — Save compact mode, notification settings per-bot in config file
+- [x] **Safe Copilot slash-command pass-through** — Allow-list low-risk Copilot CLI slash commands via Telegram `/command`
 
 ---
 
@@ -79,6 +85,7 @@ After install, restart Copilot CLI. The extension auto-connects if exactly 1 bot
 ### Event Flow
 ```
 Telegram → getUpdates (long poll) → processUpdate → session.send({ prompt })
+                       slash commands → telegram-command-router → bridge/session actions
                                                          ↓
 CLI Agent processes prompt, emits events:
   tool.execution_start → bubble update / diff rendering
@@ -96,3 +103,6 @@ CLI Agent processes prompt, emits events:
 - **Atomic command registration**: Commands passed to `joinSession({ commands })` instead of separate `session.resume` to avoid race condition.
 - **Smart auto-connect**: With 1 bot, auto-connects unless another live session owns it. With multiple bots, auto-connects to first bot with no lock or stale lock. Never steals from a live session.
 - **Compact mode**: Module-level `compactMode` flag suppresses tool bubble updates but preserves final responses, permissions, and ask_user prompts.
+- **Telegram and CLI command registries are separate**: Telegram commands are registered with `setMyCommands`; the CLI `/telegram` command is registered through `joinSession({ commands })`. Shared catalog data keeps descriptions aligned.
+- **Safe pass-through only**: `/command` forwards only allow-listed low-risk Copilot CLI slash commands and rejects everything else visibly in Telegram.
+- **Persisted health is non-secret state**: `health.json` stores the last polling state so `/status` and `/health` can explain recent degraded/recovered/error conditions after a reload.

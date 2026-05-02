@@ -56,4 +56,22 @@ describe("telegram api", () => {
         assert.deepEqual(result, { message_id: 8 });
         assert.deepEqual(requests.map(request => request.body.text), ["<bad>", "**hello**"]);
     });
+
+    it("registers Telegram command menu entries", async () => {
+        const requests = [];
+        const api = createTelegramApi({
+            getBotToken: () => "123:abc",
+            fetchFn: async (url, options) => {
+                requests.push({ url, body: JSON.parse(options.body) });
+                return Response.json({ ok: true, result: true });
+            },
+        });
+
+        await api.setMyCommands([{ command: "status", description: "Show status" }]);
+
+        assert.equal(requests[0].url, "https://api.telegram.org/bot123:abc/setMyCommands");
+        assert.deepEqual(requests[0].body, {
+            commands: [{ command: "status", description: "Show status" }],
+        });
+    });
 });

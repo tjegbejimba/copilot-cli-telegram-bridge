@@ -26,9 +26,15 @@ Fork of [examon/copilot-cli-telegram-bridge](https://github.com/examon/copilot-c
 ### Telegram Commands
 | Command | Description |
 |---|---|
+| `/help` | Show Telegram bridge commands |
+| `/status` | Show bridge connection status, session stats, and polling state |
+| `/health` | Show polling health, recent degraded/recovered state, and last error |
 | `/stop` | Abort the current agent operation with the Copilot SDK `session.abort()` API |
 | `/compact` | Toggle compact mode — suppresses tool bubble updates, shows only final responses |
-| `/telegram help` | Show all bridge commands |
+| `/disconnect` | Disconnect this Telegram bridge session |
+| `/reconnect` | Reconnect the current session to the last known bot without stealing a live different session |
+| `/command <name> [args]` | Forward an allow-listed Copilot CLI slash command (`help`, `clear`, `model`, `agents`, `extensions`) |
+| `/synccommands` | Refresh the Telegram command menu with Telegram `setMyCommands` |
 
 ### Permission Prompts
 - Real permission prompts (not auto-approved) are forwarded to Telegram with inline buttons for allow once, allow for session, allow for this location when supported, and deny
@@ -40,6 +46,8 @@ Fork of [examon/copilot-cli-telegram-bridge](https://github.com/examon/copilot-c
 - Event handlers properly reset on disconnect/reconnect
 - Telegram polling `409 Conflict` recovery retries when this session still owns the bot lock, and only releases when a live different session owns the lock
 - Sustained Telegram polling failures are surfaced and recovery is reported automatically
+- Last known polling health is persisted to `health.json`, so `/status` and `/health` can report recent degraded/recovered state after reload
+- Telegram command menus are synced automatically with `setMyCommands`; sync failures are non-fatal and can be retried with `/synccommands` or `/telegram synccommands`
 - Early session lifecycle and error events are captured through `joinSession({ onEvent })` and flushed once Telegram connects
 - Message deduplication for consecutive identical events
 - Edited message support
@@ -79,6 +87,8 @@ Fork of [examon/copilot-cli-telegram-bridge](https://github.com/examon/copilot-c
    /telegram setup mybot
    ```
 2. Paste the bot token when prompted — the extension validates it against the Telegram API
+   - The bridge tries to register Telegram slash commands automatically.
+   - If Telegram command sync fails, run `/telegram synccommands` after connecting or paste the command list shown by setup into BotFather `/setcommands`.
 3. Connect to the bot:
    ```
    /telegram connect mybot
@@ -97,8 +107,25 @@ Fork of [examon/copilot-cli-telegram-bridge](https://github.com/examon/copilot-c
 | `/telegram connect` | List all registered bots with their status |
 | `/telegram disconnect` | Disconnect from the current bot |
 | `/telegram status` | Show all bots, availability, and paired users |
+| `/telegram synccommands` | Refresh the active bot's Telegram command menu |
 | `/telegram remove <name>` | Remove a bot from the registry |
 | `/telegram help` | Show command help |
+
+## Telegram Slash Commands
+
+The bot registers a discoverable Telegram command menu automatically. If that sync fails, the bridge still works; use `/telegram synccommands` from the CLI after connecting, or configure the same commands manually through BotFather `/setcommands`.
+
+| Command | Description |
+|---|---|
+| `/help` | Show Telegram bridge commands |
+| `/status` | Show bot/session status, compact mode, stats, and polling state |
+| `/health` | Show polling health with recent degraded/recovered/error details |
+| `/stop` | Stop the current Copilot turn |
+| `/compact` | Toggle compact Telegram updates |
+| `/disconnect` | Disconnect this Telegram bridge session |
+| `/reconnect` | Reconnect to the current/affinity bot if this session can safely reclaim it |
+| `/command <name> [args]` | Forward only allow-listed Copilot CLI slash commands: `help`, `clear`, `model`, `agents`, `extensions` |
+| `/synccommands` | Refresh Telegram's command menu |
 
 ## Multiple Bots
 
@@ -117,14 +144,15 @@ Permissions, ask_user prompts, and task_complete summaries are always sent regar
 ## Troubleshooting
 
 - **Extension not loading** — verify the file exists at `~/.copilot/extensions/copilot-cli-telegram-bridge/extension.mjs`
-- **Bot not responding** — check that the token is valid. Try `/telegram status`; the bridge automatically retries transient polling conflicts and sustained Telegram API failures
+- **Bot not responding** — check that the token is valid. Try `/telegram status` and `/health`; the bridge automatically retries transient polling conflicts and sustained Telegram API failures
+- **Telegram commands missing from the menu** — run `/telegram synccommands` in the CLI or `/synccommands` in Telegram. If sync still fails, use the BotFather `/setcommands` list printed during setup.
 - **Pairing code expired** — codes expire after 5 minutes. Send a new message to the bot to get a fresh one
 - **"Another session has this bot"** — the bot is locked by another CLI session. Connecting again takes it over
 - **Duplicate messages** — kill orphaned node/copilot processes from previous sessions
 
 ## Security
 
-Bot tokens are protected before they are written to `bots.json`. On Windows, the bridge uses user-scoped DPAPI (`ConvertFrom-SecureString`) so the token can only be decrypted by the same Windows user profile. Legacy plaintext records are migrated the next time the bot is used.
+Bot tokens are protected before they are written to `bots.json`. On Windows, the bridge uses user-scoped DPAPI through .NET `System.Security.Cryptography.ProtectedData`, so the token can only be decrypted by the same Windows user profile. Legacy plaintext records are migrated the next time the bot is used.
 
 - Do not commit `bots.json` to version control
 - Do not share or back up the extension directory without removing `bots.json` first; protected tokens are still local secrets

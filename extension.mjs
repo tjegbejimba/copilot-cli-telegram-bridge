@@ -9,7 +9,13 @@ import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { execFile, execSync } from "node:child_process";
 import { abortCurrentTurn } from "./abort-session.mjs";
+import {
+    DEFAULT_BRIDGE_HEALTH,
+    loadBridgeHealth,
+    saveBridgeHealth,
+} from "./bridge-health-store.mjs";
 import { createBotStorage, loadJsonOrDefault, saveJsonAtomic } from "./bot-storage.mjs";
+import { resolveCopilotCommandPassthrough } from "./copilot-command-passthrough.mjs";
 import { createEarlyEventBuffer } from "./early-events.mjs";
 import {
     buildPermissionDecision,
@@ -24,12 +30,25 @@ import {
     resolveElicitationResponse,
     resolveUserInputResponse,
 } from "./structured-input.mjs";
+import {
+    getCliCommandDescription,
+    parseTelegramCommand,
+    getTelegramCommandMenu,
+    renderBotFatherCommandList,
+    renderCliHelp,
+    renderTelegramHelp,
+} from "./telegram-command-catalog.mjs";
+import { handleTelegramBridgeCommand } from "./telegram-command-router.mjs";
+import {
+    formatBridgeHealth,
+    formatBridgeStatus,
+} from "./telegram-command-responses.mjs";
 import { createTelegramApi } from "./telegram-api.mjs";
 import {
     createBotRecord,
     loadBotToken,
 } from "./token-store.mjs";
-import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./telegram-format.mjs";
+import { chunkMessage, markdownToTelegramHtml } from "./telegram-format.mjs";
 
 // ============================================================
 // Section 1: Constants & Configuration
@@ -38,6 +57,7 @@ import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./telegram-for
 const EXT_DIR = import.meta.dirname;
 const ACCESS_PATH = join(EXT_DIR, "access.json");
 const BOTS_REGISTRY_PATH = join(EXT_DIR, "bots.json");
+const HEALTH_PATH = join(EXT_DIR, "health.json");
 const TMP_DIR = join(tmpdir(), `telegram-bridge-${process.pid}`);
 const {
     botDir,
@@ -91,11 +111,37 @@ const {
     deleteMessage,
     setMessageReaction,
     getFile,
+    setMyCommands,
 } = createTelegramApi({
     getBotToken: () => botToken,
     getAbortSignal: () => abortController?.signal,
     markdownToTelegramHtml,
 });
+
+async function syncTelegramCommandMenu({ logResult = false } = {}) {
+    try {
+        await setMyCommands(getTelegramCommandMenu());
+        if (logResult) await session.log("Telegram command menu synced.");
+        return true;
+    } catch (err) {
+        console.warn("telegram-bridge: failed to sync Telegram commands:", err.message);
+        if (logResult) {
+            await session.log(`Could not sync Telegram command menu: ${err.message}`, { level: "warning" });
+        }
+        return false;
+    }
+}
+
+async function syncTelegramCommandMenuForToken(token) {
+    try {
+        const api = createTelegramApi({ getBotToken: () => token });
+        await api.setMyCommands(getTelegramCommandMenu());
+        return true;
+    } catch (err) {
+        console.warn("telegram-bridge: failed to sync Telegram commands during setup:", err.message);
+        return false;
+    }
+}
 
 async function sendPhoto(chatId, base64Data, mimeType, caption) {
     const ext = mimeType === "image/jpeg" ? "jpg" : mimeType === "image/gif" ? "gif" : "png";
@@ -247,6 +293,7 @@ let connected = false;
 let lastTelegramPrompts = null; // timestamp of last Telegram-originated prompt
 let compactMode = false;
 const earlyEventBuffer = createEarlyEventBuffer();
+let bridgeHealth = loadBridgeHealth(HEALTH_PATH);
 
 let botInfo = null;
 let currentSessionId = null;
@@ -280,6 +327,45 @@ function cleanExpiredPending() {
         }
     }
     if (changed) saveJsonAtomic(ACCESS_PATH, access);
+}
+
+function getStatusMessageHtml() {
+    return formatBridgeStatus({
+        connected,
+        botName: currentBotName,
+        botUsername: botInfo?.username,
+        sessionId: currentSessionId,
+        connectedAtMs: sessionStats.connectedAt?.getTime(),
+        compactMode,
+        cwd: process.env.COPILOT_CWD || process.cwd(),
+        stats: {
+            toolCalls: sessionStats.toolCalls,
+            filesEdited: sessionStats.filesEdited.size,
+            filesCreated: sessionStats.filesCreated.size,
+        },
+        polling: bridgeHealth,
+    });
+}
+
+function getHealthMessageHtml() {
+    return formatBridgeHealth({
+        connected,
+        botName: currentBotName,
+        polling: bridgeHealth,
+    });
+}
+
+function updateBridgeHealth(update) {
+    bridgeHealth = {
+        ...DEFAULT_BRIDGE_HEALTH,
+        ...bridgeHealth,
+        ...update,
+    };
+    try {
+        saveBridgeHealth(HEALTH_PATH, bridgeHealth);
+    } catch (err) {
+        console.warn(`telegram-bridge: failed to persist health state: ${err.message}`);
+    }
 }
 
 async function handlePairing(chatId, userId, text) {
@@ -675,61 +761,23 @@ async function processUpdate(update) {
     // Reload access.json on each message (hot-reload)
     reloadAccess();
 
+    if (!isAllowed(userIdStr)) {
+        await handlePairing(chatId, userId, text);
+        return;
+    }
+
+    const telegramCommand = parseTelegramCommand(text);
+    if (telegramCommand) {
+        await handleTelegramSlashCommand(telegramCommand, chatId);
+        return;
+    }
+
     // If awaiting ask_user input and sender is allowed, resolve the pending promise
     if (awaitingInput && isAllowed(userIdStr)) {
         const { resolveText } = awaitingInput;
         clearTimeout(awaitingInput.timer);
         awaitingInput = null;
         resolveText(text);
-        return;
-    }
-
-    if (!isAllowed(userIdStr)) {
-        await handlePairing(chatId, userId, text);
-        return;
-    }
-
-    // Handle /stop command — cancel the current agent turn
-    if (text.trim().toLowerCase() === "/stop") {
-        try {
-            await abortCurrentTurn(session);
-        } catch (err) {
-            console.error("telegram-bridge: abort error:", err.message);
-        }
-        await enqueue(() => sendMessage(chatId, "⏹️ Stop requested."));
-        stopTyping();
-        await dismissBubble();
-        return;
-    }
-
-    // Handle /status command — return connection info without forwarding to terminal
-    if (text.trim().toLowerCase() === "/status") {
-        const uptime = sessionStats.connectedAt
-            ? (() => {
-                const diff = Date.now() - sessionStats.connectedAt;
-                const hrs = Math.floor(diff / 3600000);
-                const mins = Math.floor((diff % 3600000) / 60000);
-                const secs = Math.floor((diff % 60000) / 1000);
-                return hrs > 0 ? `${hrs}h ${mins}m` : mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-            })()
-            : "N/A";
-        const cwd = process.env.COPILOT_CWD || process.cwd();
-        const lines = [
-            "📡 <b>Telegram Bridge Status</b>",
-            "",
-            `<b>Connected:</b> ${connected ? "✅ Yes" : "❌ No"}`,
-            `<b>Bot:</b> ${currentBotName || "none"}${botInfo?.username ? ` (@${botInfo.username})` : ""}`,
-            `<b>Session ID:</b> <code>${currentSessionId || "N/A"}</code>`,
-            `<b>Uptime:</b> ${uptime}`,
-            `<b>Compact mode:</b> ${compactMode ? "ON" : "OFF"}`,
-            `<b>Working dir:</b> <code>${escapeHtml(cwd)}</code>`,
-            "",
-            `<b>Stats this session:</b>`,
-            `  🔧 Tool calls: ${sessionStats.toolCalls}`,
-            `  ✏️ Files edited: ${sessionStats.filesEdited.size}`,
-            `  📄 Files created: ${sessionStats.filesCreated.size}`,
-        ];
-        await enqueue(() => sendMessage(chatId, lines.join("\n"), "HTML"));
         return;
     }
 
@@ -790,16 +838,6 @@ async function processUpdate(update) {
         }
     }
 
-    // Handle /compact toggle command
-    if (text.trim().toLowerCase() === "/compact") {
-        compactMode = !compactMode;
-        const msg = compactMode
-            ? "🔇 Compact mode ON — only final responses shown"
-            : "🔊 Compact mode OFF — all updates shown";
-        await enqueue(() => sendMessage(chatId, msg));
-        return;
-    }
-
     if (text) {
         lastTelegramPrompts = Date.now();
         await session.send({ prompt: text });
@@ -807,6 +845,58 @@ async function processUpdate(update) {
     }
 
     await enqueue(() => sendMessage(chatId, "Unsupported message type. Supported: text, photos, documents, and voice messages."));
+}
+
+async function handleTelegramSlashCommand(command, chatId) {
+    await handleTelegramBridgeCommand(command, chatId, {
+        connected: () => connected,
+        renderHelp: renderTelegramHelp,
+        getStatusHtml: getStatusMessageHtml,
+        getHealthHtml: getHealthMessageHtml,
+        sendMessage: (targetChatId, text, parseMode) => enqueue(() => sendMessage(targetChatId, text, parseMode)),
+        stop: async () => {
+            try {
+                await abortCurrentTurn(session);
+            } catch (err) {
+                console.error("telegram-bridge: abort error:", err.message);
+            }
+            stopTyping();
+            await dismissBubble();
+        },
+        toggleCompact: async () => {
+            compactMode = !compactMode;
+            return compactMode
+                ? "🔇 Compact mode ON — only final responses shown"
+                : "🔊 Compact mode OFF — all updates shown";
+        },
+        disconnect: () => handleDisconnect(currentSessionId || session.sessionId),
+        reconnect: handleReconnectFromTelegram,
+        syncCommands: () => syncTelegramCommandMenu({ logResult: false }),
+        resolveCommand: resolveCopilotCommandPassthrough,
+        markPromptForwarded: () => { lastTelegramPrompts = Date.now(); },
+        sendPrompt: (prompt) => session.send({ prompt }),
+    });
+}
+
+async function handleReconnectFromTelegram(chatId) {
+    const targetBotName = currentBotName || getAffinity();
+    if (!targetBotName) {
+        await enqueue(() => sendMessage(chatId, "No previous bot is known for this working directory. Use /telegram connect <name> in the CLI first."));
+        return;
+    }
+
+    const sessionId = currentSessionId || session.sessionId;
+    const lock = readLock(targetBotName);
+    if (lock && !isLockStale(lock) && lock.sessionId !== sessionId) {
+        await enqueue(() => sendMessage(chatId, `Bot '${targetBotName}' is in use by session ${lock.sessionId}; reconnect will not steal it.`));
+        return;
+    }
+
+    await enqueue(() => sendMessage(chatId, `Reconnecting '${targetBotName}'...`));
+    if (connected) {
+        await handleDisconnect(sessionId);
+    }
+    await handleConnect(targetBotName, sessionId);
 }
 
 // ============================================================
@@ -1243,7 +1333,10 @@ async function handleSetup(name) {
         "1. Open Telegram, search for @BotFather\n" +
         "2. Send /newbot and follow the prompts\n" +
         "3. Copy the bot token BotFather gives you\n" +
-        "4. Paste it here"
+        "4. Paste it here\n\n" +
+        "The bridge will try to register the Telegram command menu automatically. " +
+        "If you need to configure BotFather manually later, use:\n\n" +
+        renderBotFatherCommandList()
     );
 }
 
@@ -1286,6 +1379,7 @@ async function handleConnect(name, sessionId) {
 
     try {
         botInfo = await getMe();
+        await syncTelegramCommandMenu();
     } catch (err) {
         botToken = null;
         botInfo = null;
@@ -1544,18 +1638,18 @@ async function handleTelegramCommand(args, sessionId) {
         case "status":
             await handleStatus(sessionId);
             break;
+        case "synccommands":
+            if (!connected) {
+                await session.log("Connect a bot first, then run /telegram synccommands.");
+            } else {
+                await syncTelegramCommandMenu({ logResult: true });
+            }
+            break;
         case "remove":
             await handleRemove(botName, sessionId);
             break;
         case "help":
-            await session.log(
-                "/telegram help — Telegram Bridge commands:\n" +
-                "  setup <name>       Register a new bot (you'll be prompted for the token)\n" +
-                "  connect <name>     Start polling with a registered bot\n" +
-                "  disconnect         Stop the active polling loop\n" +
-                "  status             Show registered bots and connection state\n" +
-                "  remove <name>      Unregister a bot and delete its stored token"
-            );
+            await session.log(renderCliHelp());
             break;
         default:
             await session.log("Unknown subcommand. Run /telegram help for usage.");
@@ -1569,7 +1663,7 @@ async function handleTelegramCommand(args, sessionId) {
 function buildTelegramCommand() {
     return {
         name: "telegram",
-        description: "Telegram bridge: setup, connect, disconnect, status, remove",
+        description: getCliCommandDescription(),
         handler: async (context) => {
             await handleTelegramCommand(context.args, context.sessionId);
         },
@@ -1591,6 +1685,12 @@ async function pollLoop() {
             const updates = await getUpdates(state.offset, POLL_TIMEOUT);
             const recoveryEvent = pollHealth.recordSuccess();
             if (recoveryEvent) {
+                updateBridgeHealth({
+                    state: "healthy",
+                    consecutiveFailures: 0,
+                    lastError: null,
+                    lastRecoveredAt: new Date().toISOString(),
+                });
                 const seconds = Math.round(recoveryEvent.degradedMs / 1000);
                 const chatIds = getAllowedChatIds();
                 for (const chatId of chatIds) {
@@ -1599,10 +1699,23 @@ async function pollLoop() {
                         `✅ Telegram bridge recovered after ${recoveryEvent.failures} failed polling attempts (${seconds}s).`
                     ).catch(() => {}));
                 }
+            } else if (bridgeHealth.consecutiveFailures > 0) {
+                updateBridgeHealth({
+                    state: "healthy",
+                    consecutiveFailures: 0,
+                    lastError: null,
+                    lastRecoveredAt: new Date().toISOString(),
+                });
             }
             if (conflictRetryCount > 0) {
                 const recoveredBotName = currentBotName;
                 conflictRetryCount = 0;
+                updateBridgeHealth({
+                    state: "healthy",
+                    consecutiveFailures: 0,
+                    lastError: null,
+                    lastRecoveredAt: new Date().toISOString(),
+                });
                 const chatIds = getAllowedChatIds();
                 for (const chatId of chatIds) {
                     enqueue(() => sendMessage(chatId, `✅ Telegram bridge recovered polling for '${recoveredBotName}'.`).catch(() => {}));
@@ -1632,6 +1745,11 @@ async function pollLoop() {
 
                 if (conflictDecision === "retry") {
                     conflictRetryCount++;
+                    updateBridgeHealth({
+                        state: "conflict",
+                        consecutiveFailures: conflictRetryCount,
+                        lastError: "Telegram polling conflict",
+                    });
                     if (currentBotName && currentSessionId) {
                         writeLock(currentBotName, currentSessionId);
                     }
@@ -1665,6 +1783,10 @@ async function pollLoop() {
                 connected = false;
                 eventHandlersRegistered = false;
                 if (currentBotName && currentSessionId) removeLock(currentBotName, currentSessionId);
+                updateBridgeHealth({
+                    state: "released",
+                    lastError: "Another live session took over polling",
+                });
 
                 const lostBotName = currentBotName;
                 botToken = null;
@@ -1682,6 +1804,12 @@ async function pollLoop() {
 
             console.error(`telegram-bridge: poll error (retry in ${errorDelay}ms):`, err.message);
             const degradedEvent = pollHealth.recordFailure();
+            updateBridgeHealth({
+                state: degradedEvent || bridgeHealth.state === "degraded" ? "degraded" : "retrying",
+                consecutiveFailures: bridgeHealth.consecutiveFailures + 1,
+                lastError: err.message,
+                lastDegradedAt: degradedEvent ? new Date().toISOString() : bridgeHealth.lastDegradedAt,
+            });
             if (degradedEvent) {
                 const chatIds = getAllowedChatIds();
                 const msg =
@@ -1747,8 +1875,14 @@ async function main() {
                         });
                         saveJsonAtomic(BOTS_REGISTRY_PATH, registry, 0o600);
                         mkdirSync(botDir(name), { recursive: true });
+                        const synced = await syncTelegramCommandMenuForToken(candidateToken);
 
-                        await session.log(`Bot registered as '${name}' (@${username}). Use /telegram connect ${name} to start.`);
+                        await session.log(
+                            `Bot registered as '${name}' (@${username}). Use /telegram connect ${name} to start.` +
+                            (synced
+                                ? "\n\nTelegram command menu synced."
+                                : `\n\nTelegram command menu sync failed; run /telegram synccommands after connecting, or paste this into BotFather /setcommands:\n\n${renderBotFatherCommandList()}`)
+                        );
                     } catch (err) {
                         if (err.name === "TimeoutError" || err.name === "AbortError") {
                             await session.log("Request timed out reaching Telegram API. Check your network and try again.");
