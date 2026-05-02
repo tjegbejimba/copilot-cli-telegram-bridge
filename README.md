@@ -12,27 +12,35 @@ Fork of [examon/copilot-cli-telegram-bridge](https://github.com/examon/copilot-c
 - Handles missing or stale lock files gracefully
 
 ### Mobile Experience
-- **Terminal input forwarded** — CLI input appears in Telegram as `💬 You: ...` so you can follow the full conversation from your phone
+- **Terminal input forwarded** — CLI input appears in Telegram as `👨🏿‍💻 You: ...` so you can follow the full conversation from your phone
 - **ask_user prompts** — agent questions are forwarded to Telegram with numbered choices
+- **Structured input buttons** — single-choice enum and yes/no prompts get Telegram inline buttons
+- **Elicitation prompts** — SDK `onElicitationRequest` form prompts use the same Telegram flow as `ask_user`
 - **task_complete summaries** — see when the agent finishes and what it accomplished
 - **Diff rendering** — file edits show as `📝 path` with `-`/`+` diff snippets, creates show as `📄 Created: path`
+- **Image forwarding** — generated image files are sent back to Telegram
+- **Readable markdown tables** — tables are converted to aligned monospace blocks for mobile readability
+- **Message batching** — rapid assistant output is batched to reduce notification spam
 - **Session status on connect** — shows branch, directory, and session ID when the bot connects
 
 ### Telegram Commands
 | Command | Description |
 |---|---|
-| `/stop` | Cancel the current agent operation |
+| `/stop` | Abort the current agent operation with the Copilot SDK `session.abort()` API |
 | `/compact` | Toggle compact mode — suppresses tool bubble updates, shows only final responses |
 | `/telegram help` | Show all bridge commands |
 
 ### Permission Prompts
-- Real permission prompts (not auto-approved) are forwarded to Telegram with ✅ Allow / ❌ Deny inline buttons
+- Real permission prompts (not auto-approved) are forwarded to Telegram with inline buttons for allow once, allow for session, allow for this location when supported, and deny
 - Auto-approved tools are silent — no spam
-- Uses a 1.5s delay filter: if `permission.completed` arrives before the delay, the permission was auto-approved and no notification is sent
+- Uses a 5s delay filter: if `permission.completed` arrives before the delay, the permission was auto-approved and no notification is sent
 
 ### Reliability
 - Atomic command registration via `joinSession({ commands })` — no race conditions
 - Event handlers properly reset on disconnect/reconnect
+- Telegram polling `409 Conflict` recovery retries when this session still owns the bot lock, and only releases when a live different session owns the lock
+- Sustained Telegram polling failures are surfaced and recovery is reported automatically
+- Early session lifecycle and error events are captured through `joinSession({ onEvent })` and flushed once Telegram connects
 - Message deduplication for consecutive identical events
 - Edited message support
 - File download collision prevention (timestamp + random bytes)
@@ -49,12 +57,12 @@ Fork of [examon/copilot-cli-telegram-bridge](https://github.com/examon/copilot-c
 
 ### Manual install
 
-1. Clone the repo and copy the extension file:
-   ```bash
-   git clone https://github.com/tjegbejimba/copilot-cli-telegram-bridge.git
-   mkdir -p ~/.copilot/extensions/copilot-cli-telegram-bridge
-   cp copilot-cli-telegram-bridge/extension.mjs ~/.copilot/extensions/copilot-cli-telegram-bridge/
-   ```
+1. Clone the repo and copy the extension directory:
+    ```bash
+    git clone https://github.com/tjegbejimba/copilot-cli-telegram-bridge.git
+    mkdir -p ~/.copilot/extensions/copilot-cli-telegram-bridge
+    cp -r copilot-cli-telegram-bridge/* ~/.copilot/extensions/copilot-cli-telegram-bridge/
+    ```
 2. Restart Copilot CLI
 
 ## Create a Telegram Bot
@@ -109,17 +117,17 @@ Permissions, ask_user prompts, and task_complete summaries are always sent regar
 ## Troubleshooting
 
 - **Extension not loading** — verify the file exists at `~/.copilot/extensions/copilot-cli-telegram-bridge/extension.mjs`
-- **Bot not responding** — check that the token is valid. Try `/telegram disconnect` then `/telegram connect` again
+- **Bot not responding** — check that the token is valid. Try `/telegram status`; the bridge automatically retries transient polling conflicts and sustained Telegram API failures
 - **Pairing code expired** — codes expire after 5 minutes. Send a new message to the bot to get a fresh one
 - **"Another session has this bot"** — the bot is locked by another CLI session. Connecting again takes it over
 - **Duplicate messages** — kill orphaned node/copilot processes from previous sessions
 
 ## Security
 
-Bot tokens are stored **in plain text** in `bots.json` (with restricted file permissions — owner read/write only). Anyone with read access to that file can control your bot. Keep this in mind:
+Bot tokens are protected before they are written to `bots.json`. On Windows, the bridge uses user-scoped DPAPI (`ConvertFrom-SecureString`) so the token can only be decrypted by the same Windows user profile. Legacy plaintext records are migrated the next time the bot is used.
 
 - Do not commit `bots.json` to version control
-- Do not share or back up the extension directory without removing `bots.json` first
+- Do not share or back up the extension directory without removing `bots.json` first; protected tokens are still local secrets
 - If a token is compromised, revoke it immediately via @BotFather (`/revoke`) and register a new one with `/telegram setup`
 
 ## Uninstall

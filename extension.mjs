@@ -3,11 +3,33 @@
 // ============================================================
 
 import { joinSession } from "@github/copilot-sdk/extension";
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, renameSync, unlinkSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync, existsSync, unlinkSync } from "node:fs";
 import { join, basename } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { execFile, execSync } from "node:child_process";
+import { abortCurrentTurn } from "./abort-session.mjs";
+import { createBotStorage, loadJsonOrDefault, saveJsonAtomic } from "./bot-storage.mjs";
+import { createEarlyEventBuffer } from "./early-events.mjs";
+import {
+    buildPermissionDecision,
+    getPermissionActions,
+    parsePermissionCallbackData,
+} from "./permission-decisions.mjs";
+import { createPollHealthTracker } from "./poll-health.mjs";
+import { classifyPollingConflict } from "./reconnect-policy.mjs";
+import {
+    buildStructuredPrompt,
+    parseStructuredInputCallbackData,
+    resolveElicitationResponse,
+    resolveUserInputResponse,
+} from "./structured-input.mjs";
+import { createTelegramApi } from "./telegram-api.mjs";
+import {
+    createBotRecord,
+    loadBotToken,
+} from "./token-store.mjs";
+import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./telegram-format.mjs";
 
 // ============================================================
 // Section 1: Constants & Configuration
@@ -16,13 +38,20 @@ import { execFile, execSync } from "node:child_process";
 const EXT_DIR = import.meta.dirname;
 const ACCESS_PATH = join(EXT_DIR, "access.json");
 const BOTS_REGISTRY_PATH = join(EXT_DIR, "bots.json");
-const BOTS_DIR = join(EXT_DIR, "bots");
-const AFFINITY_PATH = join(EXT_DIR, "affinity.json");
 const TMP_DIR = join(tmpdir(), `telegram-bridge-${process.pid}`);
+const {
+    botDir,
+    botStatePath,
+    getAffinity,
+    setAffinity,
+    readLock,
+    writeLock,
+    removeLock,
+    isLockStale,
+} = createBotStorage({ extensionDir: EXT_DIR });
 
 const TELEGRAM_API = "https://api.telegram.org";
 const POLL_TIMEOUT = 30;
-const CHUNK_MAX = 4096;
 const SEND_PACE_MS = 50;
 const TYPING_INTERVAL_MS = 4000;
 const TYPING_DEBOUNCE_MS = 60000;
@@ -31,171 +60,12 @@ const PAIRING_EXPIRY_MS = 300000;
 const ERROR_RETRY_BASE_MS = 5000;
 const ERROR_RETRY_MAX_MS = 60000;
 const API_TIMEOUT_MS = 30000;
+const POLL_DEGRADED_THRESHOLD = 3;
 
 
 // ============================================================
 // Section 2: Utility Functions
 // ============================================================
-
-function loadJsonOrDefault(filePath, defaultValue) {
-    try {
-        return JSON.parse(readFileSync(filePath, "utf-8"));
-    } catch (err) {
-        if (err.code === "ENOENT") return structuredClone(defaultValue);
-        if (err instanceof SyntaxError) {
-            console.warn(`telegram-bridge: corrupted JSON in ${filePath}, using defaults`);
-            return structuredClone(defaultValue);
-        }
-        throw err;
-    }
-}
-
-function saveJsonAtomic(filePath, data, mode) {
-    const tmp = filePath + ".tmp";
-    const opts = mode != null ? { mode } : undefined;
-    writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", opts);
-    renameSync(tmp, filePath);
-}
-
-function botDir(name) { return join(BOTS_DIR, name); }
-function botStatePath(name) { return join(botDir(name), "state.json"); }
-function botLockPath(name) { return join(botDir(name), "lock.json"); }
-
-// Per-directory bot affinity — remembers which bot was last used in each working directory
-function getAffinity() {
-    const cwd = process.env.COPILOT_CWD || process.cwd();
-    const map = loadJsonOrDefault(AFFINITY_PATH, {});
-    return map[cwd] || null;
-}
-function setAffinity(botName) {
-    const cwd = process.env.COPILOT_CWD || process.cwd();
-    const map = loadJsonOrDefault(AFFINITY_PATH, {});
-    map[cwd] = botName;
-    saveJsonAtomic(AFFINITY_PATH, map);
-}
-
-function chunkMessage(text, maxLen = CHUNK_MAX) {
-    const chunks = [];
-    let remaining = text;
-    while (remaining.length > maxLen) {
-        let splitAt = remaining.lastIndexOf("\n\n", maxLen);
-        if (splitAt <= 0) splitAt = remaining.lastIndexOf("\n", maxLen);
-        if (splitAt <= 0) splitAt = maxLen;
-        chunks.push(remaining.slice(0, splitAt));
-        remaining = remaining.slice(splitAt).replace(/^\n+/, "");
-    }
-    if (remaining.length > 0) chunks.push(remaining);
-    return chunks;
-}
-
-// --- Markdown to Telegram HTML converter ---
-
-function escapeHtml(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function markdownToTelegramHtml(md) {
-    const holds = [];
-
-    function hold(html) {
-        const i = holds.length;
-        holds.push(html);
-        return `\x00${i}\x00`;
-    }
-
-    let t = md;
-
-    // Phase 1: Extract protected regions (no markdown processing inside these)
-
-    // Markdown tables: detect lines starting with | and convert to clean aligned <pre>
-    t = t.replace(/(?:^\|.+\|[ ]*$\n?)+/gm, (block) => {
-        const lines = block.trimEnd().split("\n");
-        // Parse cells from each row
-        const rows = lines.map(line =>
-            line.replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim())
-        );
-        // Filter out separator rows (---) 
-        const dataRows = rows.filter(row => !row.every(c => /^[-:]+$/.test(c)));
-        if (dataRows.length === 0) return hold(`<pre>${escapeHtml(block.trimEnd())}</pre>`);
-        // Calculate column widths
-        const colCount = Math.max(...dataRows.map(r => r.length));
-        const widths = Array.from({ length: colCount }, (_, i) =>
-            Math.max(...dataRows.map(r => (r[i] || "").length))
-        );
-        // Format: header row, separator, data rows
-        const formatted = dataRows.map((row, idx) => {
-            const padded = row.map((cell, i) => (cell || "").padEnd(widths[i] || 0)).join("  ");
-            if (idx === 0) {
-                const sep = widths.map(w => "\u2500".repeat(w)).join("\u2500\u2500");
-                return padded + "\n" + sep;
-            }
-            return padded;
-        }).join("\n");
-        return hold(`<pre>${escapeHtml(formatted)}</pre>`);
-    });
-
-    // Fenced code blocks: ```lang\ncode\n```
-    t = t.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-        code = code.replace(/\n$/, "");
-        const cls = lang ? ` class="language-${lang}"` : "";
-        return hold(`<pre><code${cls}>${escapeHtml(code)}</code></pre>`);
-    });
-
-    // Inline code: `code`
-    t = t.replace(/`([^`\n]+)`/g, (_, code) => {
-        return hold(`<code>${escapeHtml(code)}</code>`);
-    });
-
-    // Images: ![alt](url) -> linked text (before regular links)
-    t = t.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, url) => {
-        const label = alt || "image";
-        return hold(`<a href="${escapeHtml(url)}">[${escapeHtml(label)}]</a>`);
-    });
-
-    // Links: [text](url)
-    t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => {
-        return hold(`<a href="${escapeHtml(url)}">${escapeHtml(text)}</a>`);
-    });
-
-    // Phase 2: HTML-escape remaining text
-    t = escapeHtml(t);
-
-    // Phase 3: Inline formatting (order matters: bold+italic before bold before italic)
-
-    // Bold+italic: ***text***
-    t = t.replace(/\*\*\*(.+?)\*\*\*/g, "<b><i>$1</i></b>");
-
-    // Bold: **text**
-    t = t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
-
-    // Italic: *text* (not adjacent to other asterisks)
-    t = t.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "<i>$1</i>");
-
-    // Strikethrough: ~~text~~
-    t = t.replace(/~~(.+?)~~/g, "<s>$1</s>");
-
-    // Phase 4: Block-level formatting
-
-    // Headers: # text -> bold text
-    t = t.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
-
-    // Blockquotes: consecutive lines starting with > (escaped to &gt;)
-    t = t.replace(/(?:^&gt;[ ]?.*$\n?)+/gm, (block) => {
-        const lines = block.trimEnd().split("\n");
-        const content = lines.map(l => l.replace(/^&gt;[ ]?/, "")).join("\n");
-        return `<blockquote>${content}</blockquote>\n`;
-    });
-
-    // Horizontal rules
-    t = t.replace(/^-{3,}$/gm, "\u2500".repeat(20));
-    t = t.replace(/^\*{3,}$/gm, "\u2500".repeat(20));
-    t = t.replace(/^_{3,}$/gm, "\u2500".repeat(20));
-
-    // Phase 5: Restore placeholders
-    t = t.replace(/\x00(\d+)\x00/g, (_, i) => holds[parseInt(i)]);
-
-    return t;
-}
 
 function generatePairingCode() {
     return randomBytes(4).toString("hex").slice(0, 6);
@@ -210,71 +80,22 @@ function sleep(ms) {
 // ============================================================
 
 let botToken;
-
-async function callTelegram(method, params = {}) {
-    const url = `${TELEGRAM_API}/bot${botToken}/${method}`;
-    const timeoutMs = method === "getUpdates"
-        ? (POLL_TIMEOUT + 10) * 1000
-        : API_TIMEOUT_MS;
-    const timeoutSignal = AbortSignal.timeout(timeoutMs);
-    const signal = method === "getUpdates" && abortController
-        ? AbortSignal.any([abortController.signal, timeoutSignal])
-        : timeoutSignal;
-    const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(params),
-        signal,
-    });
-    if (res.status === 409) {
-        const err = new Error("Conflict: another process is polling this bot");
-        err.status = 409;
-        throw err;
-    }
-    if (res.status === 429) {
-        const body = await res.json().catch(() => ({}));
-        const err = new Error("Rate limited");
-        err.status = 429;
-        err.retryAfter = body?.parameters?.retry_after || 5;
-        throw err;
-    }
-    if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        const err = new Error(`Telegram API ${method} failed: ${res.status} ${body}`);
-        err.status = res.status;
-        throw err;
-    }
-    const json = await res.json();
-    if (!json.ok) throw new Error(`Telegram API ${method} returned ok=false: ${JSON.stringify(json)}`);
-    return json.result;
-}
-
-function getMe() { return callTelegram("getMe"); }
-
-function getUpdates(offset, timeout) {
-    return callTelegram("getUpdates", { offset, timeout, allowed_updates: ["message", "edited_message", "callback_query"] });
-}
-
-function sendMessage(chatId, text, parseMode) {
-    const params = { chat_id: chatId, text };
-    if (parseMode) params.parse_mode = parseMode;
-    return callTelegram("sendMessage", params);
-}
-
-async function sendFormattedMessage(chatId, markdown) {
-    const html = markdownToTelegramHtml(markdown);
-    try {
-        return await callTelegram("sendMessage", {
-            chat_id: chatId, text: html, parse_mode: "HTML",
-        });
-    } catch (err) {
-        // Fall back to plain text if Telegram rejects our HTML
-        if (err.message && /can.t parse|entit/i.test(err.message)) {
-            return callTelegram("sendMessage", { chat_id: chatId, text: markdown });
-        }
-        throw err;
-    }
-}
+const {
+    callTelegram,
+    getMe,
+    getUpdates,
+    sendMessage,
+    sendFormattedMessage,
+    sendChatAction,
+    editMessageText,
+    deleteMessage,
+    setMessageReaction,
+    getFile,
+} = createTelegramApi({
+    getBotToken: () => botToken,
+    getAbortSignal: () => abortController?.signal,
+    markdownToTelegramHtml,
+});
 
 async function sendPhoto(chatId, base64Data, mimeType, caption) {
     const ext = mimeType === "image/jpeg" ? "jpg" : mimeType === "image/gif" ? "gif" : "png";
@@ -307,32 +128,6 @@ async function sendDocument(chatId, base64Data, mimeType, filename, caption) {
         throw new Error(`Telegram sendDocument failed: ${res.status} ${body}`);
     }
     return (await res.json()).result;
-}
-
-function sendChatAction(chatId, action = "typing") {
-    return callTelegram("sendChatAction", { chat_id: chatId, action });
-}
-
-function editMessageText(chatId, messageId, text, parseMode) {
-    const params = { chat_id: chatId, message_id: messageId, text };
-    if (parseMode) params.parse_mode = parseMode;
-    return callTelegram("editMessageText", params);
-}
-
-function deleteMessage(chatId, messageId) {
-    return callTelegram("deleteMessage", { chat_id: chatId, message_id: messageId });
-}
-
-
-function setMessageReaction(chatId, messageId, emoji) {
-    return callTelegram("setMessageReaction", {
-        chat_id: chatId, message_id: messageId,
-        reaction: [{ type: "emoji", emoji }],
-    });
-}
-
-function getFile(fileId) {
-    return callTelegram("getFile", { file_id: fileId });
 }
 
 async function downloadFile(filePath) {
@@ -451,6 +246,7 @@ let awaitingInput = null;
 let connected = false;
 let lastTelegramPrompts = null; // timestamp of last Telegram-originated prompt
 let compactMode = false;
+const earlyEventBuffer = createEarlyEventBuffer();
 
 let botInfo = null;
 let currentSessionId = null;
@@ -461,41 +257,6 @@ let sessionStats = { toolCalls: 0, filesEdited: new Set(), filesCreated: new Set
 
 // Message batching (Feature 2: Smart Notification Batching)
 let messageBatch = { content: "", timer: null };
-
-// ============================================================
-// Section 5b: Lock File Management
-// ============================================================
-
-function readLock(name) {
-    const data = loadJsonOrDefault(botLockPath(name), null);
-    if (!data || !data.pid || !data.sessionId) return null;
-    return data;
-}
-
-function writeLock(name, sessionId) {
-    saveJsonAtomic(botLockPath(name), {
-        pid: process.pid,
-        sessionId,
-        connectedAt: new Date().toISOString(),
-    });
-}
-
-function removeLock(name, sessionId) {
-    const lock = readLock(name);
-    if (lock && lock.sessionId === sessionId) {
-        try { rmSync(botLockPath(name), { force: true }); } catch {}
-    }
-}
-
-function isLockStale(lock) {
-    if (!lock) return true;
-    try {
-        process.kill(lock.pid, 0);
-        return false;
-    } catch {
-        return true;
-    }
-}
 
 // ============================================================
 // Section 6: Access Control & Pairing
@@ -804,6 +565,21 @@ function getAllowedChatIds() {
     return access.allowedUsers.map(Number);
 }
 
+const pendingPermissionRequests = new Map();
+
+function permissionDecisionLabel(decision) {
+    switch (decision.kind) {
+        case "approve-once":
+            return "once";
+        case "approve-for-session":
+            return "session";
+        case "approve-for-location":
+            return "this location";
+        default:
+            return decision.kind;
+    }
+}
+
 async function processUpdate(update) {
     // --- Handle callback queries (inline keyboard responses) ---
     if (update.callback_query) {
@@ -820,26 +596,64 @@ async function processUpdate(update) {
 
         if (cbChatId != null && cbUserId != null && isAllowed(cbUserIdStr)) {
             // Handle permission inline keyboard buttons
-            if (cbData && cbData.startsWith("perm_")) {
-                const [action, reqId] = cbData.split(":");
-                if (reqId) {
-                    const approved = action === "perm_allow";
-                    const result = approved
-                        ? { kind: "approved" }
-                        : { kind: "denied-by-rules", rules: [] };
+            const structuredCallback = parseStructuredInputCallbackData(cbData);
+            if (structuredCallback) {
+                const pending = awaitingInput;
+                const choice = pending?.promptId === structuredCallback.promptId
+                    ? pending.prompt.choices[structuredCallback.choiceIndex]
+                    : null;
 
+                if (pending && choice) {
+                    clearTimeout(pending.timer);
+                    awaitingInput = null;
+                    pending.resolveValue(choice.value);
+
+                    enqueue(() => callTelegram("editMessageText", {
+                        chat_id: cbChatId,
+                        message_id: cbq.message?.message_id,
+                        text: `✅ Answered: ${choice.label}`,
+                    }).catch(() => {}));
+                } else {
+                    enqueue(() => callTelegram("editMessageText", {
+                        chat_id: cbChatId,
+                        message_id: cbq.message?.message_id,
+                        text: "⚠️ That input prompt is no longer active.",
+                    }).catch(() => {}));
+                }
+                return;
+            }
+
+            const permissionCallback = parsePermissionCallbackData(cbData);
+            if (permissionCallback) {
+                const { action, requestId } = permissionCallback;
+                const pending = pendingPermissionRequests.get(requestId);
+                const result = buildPermissionDecision(action, pending?.permissionRequest, {
+                    locationKey: process.env.COPILOT_CWD || process.cwd(),
+                });
+
+                if (result) {
                     // Respond to the permission via SDK
                     session.rpc.permissions.handlePendingPermissionRequest({
-                        requestId: reqId,
+                        requestId,
                         result,
                     }).catch(err => console.error("telegram-bridge: permission response failed:", err.message));
 
+                    pendingPermissionRequests.delete(requestId);
+
                     // Edit the message to show the decision
-                    const decisionText = approved ? "✅ Permission granted" : "❌ Permission denied";
+                    const decisionText = result.kind === "reject"
+                        ? "❌ Permission denied"
+                        : `✅ Permission granted (${permissionDecisionLabel(result)})`;
                     enqueue(() => callTelegram("editMessageText", {
                         chat_id: cbChatId,
                         message_id: cbq.message?.message_id,
                         text: decisionText,
+                    }).catch(() => {}));
+                } else {
+                    enqueue(() => callTelegram("editMessageText", {
+                        chat_id: cbChatId,
+                        message_id: cbq.message?.message_id,
+                        text: "⚠️ That permission option is no longer available for this request.",
                     }).catch(() => {}));
                 }
                 return;
@@ -863,10 +677,10 @@ async function processUpdate(update) {
 
     // If awaiting ask_user input and sender is allowed, resolve the pending promise
     if (awaitingInput && isAllowed(userIdStr)) {
-        const { resolve } = awaitingInput;
+        const { resolveText } = awaitingInput;
         clearTimeout(awaitingInput.timer);
         awaitingInput = null;
-        resolve(text);
+        resolveText(text);
         return;
     }
 
@@ -878,23 +692,11 @@ async function processUpdate(update) {
     // Handle /stop command — cancel the current agent turn
     if (text.trim().toLowerCase() === "/stop") {
         try {
-            const cancelTimeout = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error("cancel timed out")), 10000)
-            );
-            const cancelAction = (async () => {
-                if (typeof session.cancel === "function") {
-                    await session.cancel();
-                } else if (session.connection && typeof session.connection.sendRequest === "function") {
-                    await session.connection.sendRequest("session.cancel", { sessionId: session.sessionId });
-                } else {
-                    await session.send({ cancel: true });
-                }
-            })();
-            await Promise.race([cancelAction, cancelTimeout]);
+            await abortCurrentTurn(session);
         } catch (err) {
-            console.error("telegram-bridge: cancel error:", err.message);
+            console.error("telegram-bridge: abort error:", err.message);
         }
-        await enqueue(() => sendMessage(chatId, "⏹️ Cancel requested."));
+        await enqueue(() => sendMessage(chatId, "⏹️ Stop requested."));
         stopTyping();
         await dismissBubble();
         return;
@@ -1012,40 +814,7 @@ async function processUpdate(update) {
 // ============================================================
 
 function renderAskUserPrompt(args) {
-    let questionText = args.question || args.message || "Input needed:";
-
-    if (args.requestedSchema?.properties) {
-        const props = args.requestedSchema.properties;
-        const lines = [questionText, ""];
-        for (const [key, field] of Object.entries(props)) {
-            const label = field.title || key;
-            if (field.enum && field.enum.length > 0) {
-                const names = field.enumNames || field.enum;
-                lines.push(`${label}:`);
-                names.forEach((name, i) => {
-                    const marker = field.default === field.enum[i] ? " ✓" : "";
-                    lines.push(`  ${i + 1}) ${name}${marker}`);
-                });
-            } else if (field.oneOf && field.oneOf.length > 0) {
-                lines.push(`${label}:`);
-                field.oneOf.forEach((opt, i) => {
-                    const marker = field.default === opt.const ? " ✓" : "";
-                    lines.push(`  ${i + 1}) ${opt.title || opt.const}${marker}`);
-                });
-            } else if (field.type === "boolean") {
-                const def = field.default != null ? ` (default: ${field.default ? "yes" : "no"})` : "";
-                lines.push(`${label}: yes/no${def}`);
-            } else {
-                const def = field.default != null ? ` (default: ${field.default})` : "";
-                lines.push(`${label}${def}`);
-            }
-            if (field.description) lines.push(`  → ${field.description}`);
-        }
-        lines.push("", "↩️ Reply in the terminal to answer.");
-        questionText = lines.join("\n");
-    }
-
-    return questionText;
+    return buildStructuredPrompt(args).text;
 }
 
 // ============================================================
@@ -1057,6 +826,12 @@ function renderAskUserPrompt(args) {
 // ============================================================
 
 let eventHandlersRegistered = false;
+
+function handleEarlySessionEvent(event) {
+    if (!connected) {
+        earlyEventBuffer.record(event);
+    }
+}
 
 function flushMessageBatch() {
     if (messageBatch.timer) {
@@ -1081,7 +856,7 @@ function setupEventHandlers(sess) {
     eventHandlersRegistered = true;
 
     // Permission prompt forwarding: only notify Telegram for prompts that
-    // actually need user input (not auto-approved). We delay 1.5s after
+    // actually need user input (not auto-approved). We delay 5s after
     // permission.requested — if permission.completed arrives before then,
     // it was auto-approved and we skip the notification.
     const pendingPermissions = new Map(); // requestId → timer
@@ -1089,35 +864,45 @@ function setupEventHandlers(sess) {
 
     sess.on("permission.requested", (event) => {
         if (!connected) return;
+        if (event.data.resolvedByHook) return;
         const req = event.data.permissionRequest || event.data;
         const requestId = event.data.requestId;
+        if (!requestId) return;
+        pendingPermissionRequests.set(requestId, { permissionRequest: req });
 
         const timer = setTimeout(() => {
             pendingPermissions.delete(requestId);
             activePermissionRequestId = requestId;
 
-            // Still pending after 1.5s — this is a real user prompt
+            // Still pending after 5s — this is a real user prompt
             const lines = ["🔐 **Permission needed**", ""];
             if (req.kind === "shell" && req.fullCommandText) {
                 lines.push(`Command: \`${req.fullCommandText}\``);
-            } else if ((req.kind === "write" || req.kind === "read") && req.fileName) {
+            } else if (req.kind === "write" && req.fileName) {
                 lines.push(`${req.kind}: \`${req.fileName}\``);
+            } else if (req.kind === "read" && req.path) {
+                lines.push(`${req.kind}: \`${req.path}\``);
             } else {
                 lines.push(`Type: ${req.kind || "unknown"}`);
             }
 
             const chatIds = getAllowedChatIds();
             const html = markdownToTelegramHtml(lines.join("\n"));
+            const actions = getPermissionActions(req, {
+                locationKey: process.env.COPILOT_CWD || process.cwd(),
+            });
+            const inlineKeyboard = actions.map(action => [{
+                text: action.label,
+                callback_data: `perm:${action.id}:${requestId}`,
+            }]);
+
             for (const chatId of chatIds) {
                 enqueue(() => callTelegram("sendMessage", {
                     chat_id: chatId,
                     text: html,
                     parse_mode: "HTML",
                     reply_markup: JSON.stringify({
-                        inline_keyboard: [[
-                            { text: "✅ Allow", callback_data: `perm_allow:${requestId}` },
-                            { text: "❌ Deny", callback_data: `perm_deny:${requestId}` }
-                        ]]
+                        inline_keyboard: inlineKeyboard,
                     })
                 }).catch(() => sendFormattedMessage(chatId, lines.join("\n"))));
             }
@@ -1128,6 +913,7 @@ function setupEventHandlers(sess) {
 
     sess.on("permission.completed", (event) => {
         const requestId = event.data.requestId;
+        pendingPermissionRequests.delete(requestId);
         if (requestId === activePermissionRequestId) {
             activePermissionRequestId = null;
         }
@@ -1370,113 +1156,62 @@ function setupEventHandlers(sess) {
 // ============================================================
 
 function createUserInputHandler() {
-    return (request) => {
-        return new Promise((resolve) => {
-            let questionText = request.question || request.message || "Input needed:";
+    return (request) => createStructuredInputRequest(request, "user-input");
+}
 
-            // Render requestedSchema properties as numbered choices or field prompts
-            if (request.requestedSchema?.properties) {
-                const props = request.requestedSchema.properties;
-                const lines = [questionText, ""];
-                for (const [key, field] of Object.entries(props)) {
-                    const label = field.title || key;
-                    if (field.enum && field.enum.length > 0) {
-                        // Enum field — show as numbered choices
-                        const names = field.enumNames || field.enum;
-                        lines.push(`${label}:`);
-                        names.forEach((name, i) => {
-                            const marker = field.default === field.enum[i] ? " ✓" : "";
-                            lines.push(`  ${i + 1}) ${name}${marker}`);
-                        });
-                    } else if (field.oneOf && field.oneOf.length > 0) {
-                        lines.push(`${label}:`);
-                        field.oneOf.forEach((opt, i) => {
-                            const marker = field.default === opt.const ? " ✓" : "";
-                            lines.push(`  ${i + 1}) ${opt.title || opt.const}${marker}`);
-                        });
-                    } else if (field.type === "boolean") {
-                        const def = field.default != null ? ` (default: ${field.default ? "yes" : "no"})` : "";
-                        lines.push(`${label}: yes/no${def}`);
-                    } else {
-                        const def = field.default != null ? ` (default: ${field.default})` : "";
-                        lines.push(`${label}${def}`);
-                    }
-                    if (field.description) lines.push(`  → ${field.description}`);
-                }
-                lines.push("", "Reply with your choice (number or text):");
-                questionText = lines.join("\n");
-            } else if (request.choices && request.choices.length > 0) {
-                const choiceList = request.choices
-                    .map((c, i) => `${i + 1}) ${c}`)
-                    .join("\n");
-                questionText = `${questionText}\n${choiceList}`;
-            }
+function createElicitationHandler() {
+    return (context) => createStructuredInputRequest(context, "elicitation");
+}
 
-            const chatIds = getAllowedChatIds();
-            const chunks = chunkMessage(questionText);
-            for (const chatId of chatIds) {
+function createStructuredInputRequest(request, kind) {
+    return new Promise((resolve) => {
+        const promptId = randomBytes(4).toString("hex");
+        const prompt = buildStructuredPrompt(request, { promptId });
+        const chatIds = getAllowedChatIds();
+        const chunks = chunkMessage(prompt.text);
+
+        for (const chatId of chatIds) {
+            if (prompt.inlineKeyboard && chunks.length === 1) {
+                enqueue(() => callTelegram("sendMessage", {
+                    chat_id: chatId,
+                    text: markdownToTelegramHtml(chunks[0]),
+                    parse_mode: "HTML",
+                    reply_markup: JSON.stringify({ inline_keyboard: prompt.inlineKeyboard }),
+                }).catch(() => sendFormattedMessage(chatId, chunks[0])));
+            } else {
                 for (const chunk of chunks) {
                     enqueue(() => sendFormattedMessage(chatId, chunk));
                 }
             }
+        }
 
-            const timer = setTimeout(() => {
-                if (awaitingInput && awaitingInput.timer === timer) {
-                    awaitingInput = null;
-                }
+        const resolveValue = (value) => {
+            if (kind === "elicitation") {
+                resolve(resolveElicitationResponse(request, value));
+            } else {
+                resolve(resolveUserInputResponse(request, value));
+            }
+        };
+
+        const timer = setTimeout(() => {
+            if (awaitingInput && awaitingInput.timer === timer) {
+                awaitingInput = null;
+            }
+            if (kind === "elicitation") {
+                resolve({ action: "cancel" });
+            } else {
                 resolve({ answer: "", wasFreeform: true });
-            }, ASK_USER_TIMEOUT_MS);
+            }
+        }, ASK_USER_TIMEOUT_MS);
 
-            awaitingInput = {
-                resolve: (rawText) => {
-                    let answer = rawText;
-                    let wasFreeform = true;
-
-                    // Try to match against schema enum/oneOf choices
-                    if (request.requestedSchema?.properties) {
-                        const props = request.requestedSchema.properties;
-                        for (const [, field] of Object.entries(props)) {
-                            const options = field.enum || (field.oneOf ? field.oneOf.map(o => o.const) : null);
-                            const labels = field.enumNames || (field.oneOf ? field.oneOf.map(o => o.title || o.const) : null);
-                            if (options) {
-                                const num = parseInt(rawText.trim(), 10);
-                                if (!isNaN(num) && num >= 1 && num <= options.length) {
-                                    answer = options[num - 1];
-                                    wasFreeform = false;
-                                    break;
-                                }
-                                const match = (labels || options).find(
-                                    c => c.toLowerCase() === rawText.trim().toLowerCase()
-                                );
-                                if (match) {
-                                    const idx = (labels || options).indexOf(match);
-                                    answer = options[idx] ?? match;
-                                    wasFreeform = false;
-                                    break;
-                                }
-                            }
-                        }
-                    } else if (request.choices && request.choices.length > 0) {
-                        const num = parseInt(rawText.trim(), 10);
-                        if (!isNaN(num) && num >= 1 && num <= request.choices.length) {
-                            answer = request.choices[num - 1];
-                            wasFreeform = false;
-                        } else {
-                            const match = request.choices.find(
-                                c => c.toLowerCase() === rawText.trim().toLowerCase()
-                            );
-                            if (match) {
-                                answer = match;
-                                wasFreeform = false;
-                            }
-                        }
-                    }
-                    resolve({ answer, wasFreeform });
-                },
-                timer,
-            };
-        });
-    };
+        awaitingInput = {
+            promptId,
+            prompt,
+            timer,
+            resolveText: resolveValue,
+            resolveValue,
+        };
+    });
 }
 
 // ============================================================
@@ -1536,7 +1271,19 @@ async function handleConnect(name, sessionId) {
     }
 
     // Validate token via getMe
-    botToken = registry[name].token;
+    try {
+        const loadedToken = loadBotToken(registry[name]);
+        botToken = loadedToken.token;
+        if (loadedToken.migrated) {
+            registry[name] = loadedToken.record;
+            saveJsonAtomic(BOTS_REGISTRY_PATH, registry, 0o600);
+        }
+    } catch (err) {
+        botToken = null;
+        await session.log(`Could not load bot token for '${name}': ${err.message}`, { level: "error" });
+        return;
+    }
+
     try {
         botInfo = await getMe();
     } catch (err) {
@@ -1584,6 +1331,12 @@ async function handleConnect(name, sessionId) {
     setAffinity(name);
 
     const chatIds = getAllowedChatIds();
+    const earlyEvents = earlyEventBuffer.flush();
+    for (const eventMessage of earlyEvents) {
+        for (const chatId of chatIds) {
+            enqueue(() => sendMessage(chatId, eventMessage).catch(() => {}));
+        }
+    }
 
     if (chatIds.length === 0) {
         await session.log(
@@ -1829,11 +1582,32 @@ function buildTelegramCommand() {
 
 async function pollLoop() {
     let errorDelay = ERROR_RETRY_BASE_MS;
+    let conflictRetryCount = 0;
+    const pollHealth = createPollHealthTracker({ threshold: POLL_DEGRADED_THRESHOLD });
 
     while (!shutdownRequested) {
         abortController = new AbortController();
         try {
             const updates = await getUpdates(state.offset, POLL_TIMEOUT);
+            const recoveryEvent = pollHealth.recordSuccess();
+            if (recoveryEvent) {
+                const seconds = Math.round(recoveryEvent.degradedMs / 1000);
+                const chatIds = getAllowedChatIds();
+                for (const chatId of chatIds) {
+                    enqueue(() => sendMessage(
+                        chatId,
+                        `✅ Telegram bridge recovered after ${recoveryEvent.failures} failed polling attempts (${seconds}s).`
+                    ).catch(() => {}));
+                }
+            }
+            if (conflictRetryCount > 0) {
+                const recoveredBotName = currentBotName;
+                conflictRetryCount = 0;
+                const chatIds = getAllowedChatIds();
+                for (const chatId of chatIds) {
+                    enqueue(() => sendMessage(chatId, `✅ Telegram bridge recovered polling for '${recoveredBotName}'.`).catch(() => {}));
+                }
+            }
             errorDelay = ERROR_RETRY_BASE_MS;
 
             for (const update of updates) {
@@ -1852,6 +1626,33 @@ async function pollLoop() {
             if (abortController.signal.aborted) break;
 
             if (err.status === 409) {
+                const lock = currentBotName ? readLock(currentBotName) : null;
+                const lockIsStale = lock ? isLockStale(lock) : true;
+                const conflictDecision = classifyPollingConflict({ lock, currentSessionId, lockIsStale });
+
+                if (conflictDecision === "retry") {
+                    conflictRetryCount++;
+                    if (currentBotName && currentSessionId) {
+                        writeLock(currentBotName, currentSessionId);
+                    }
+
+                    const retryDelay = Math.min(ERROR_RETRY_BASE_MS * conflictRetryCount, ERROR_RETRY_MAX_MS);
+                    console.warn(`telegram-bridge: polling conflict for '${currentBotName}' (retry ${conflictRetryCount}, next in ${retryDelay}ms)`);
+
+                    if (conflictRetryCount === 1 || conflictRetryCount % 5 === 0) {
+                        const chatIds = getAllowedChatIds();
+                        const msg =
+                            `⚠️ Telegram bridge polling conflict for '${currentBotName}'. ` +
+                            `Keeping this session connected and retrying automatically.`;
+                        for (const chatId of chatIds) {
+                            enqueue(() => sendMessage(chatId, msg).catch(() => {}));
+                        }
+                    }
+
+                    await sleep(retryDelay);
+                    continue;
+                }
+
                 // Save state before clearing
                 if (state && currentBotName) {
                     try { saveJsonAtomic(botStatePath(currentBotName), state); } catch {}
@@ -1880,6 +1681,16 @@ async function pollLoop() {
             }
 
             console.error(`telegram-bridge: poll error (retry in ${errorDelay}ms):`, err.message);
+            const degradedEvent = pollHealth.recordFailure();
+            if (degradedEvent) {
+                const chatIds = getAllowedChatIds();
+                const msg =
+                    `⚠️ Telegram bridge is having trouble reaching Telegram ` +
+                    `(${degradedEvent.failures} consecutive polling failures). Retrying automatically.`;
+                for (const chatId of chatIds) {
+                    enqueue(() => sendMessage(chatId, msg).catch(() => {}));
+                }
+            }
             await sleep(errorDelay);
             errorDelay = Math.min(errorDelay * 2, ERROR_RETRY_MAX_MS);
         }
@@ -1896,7 +1707,9 @@ async function main() {
     cleanupTmpDir();
 
     session = await joinSession({
+        onEvent: handleEarlySessionEvent,
         onUserInputRequest: createUserInputHandler(),
+        onElicitationRequest: createElicitationHandler(),
         commands: [buildTelegramCommand()],
         hooks: {
             onUserPromptSubmitted: (input) => {
@@ -1927,11 +1740,11 @@ async function main() {
 
                         // Re-read registry (another session may have modified it)
                         registry = loadJsonOrDefault(BOTS_REGISTRY_PATH, {});
-                        registry[name] = {
+                        registry[name] = createBotRecord({
                             token: candidateToken,
                             username,
                             addedAt: new Date().toISOString(),
-                        };
+                        });
                         saveJsonAtomic(BOTS_REGISTRY_PATH, registry, 0o600);
                         mkdirSync(botDir(name), { recursive: true });
 

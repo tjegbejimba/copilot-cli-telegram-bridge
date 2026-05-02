@@ -12,5 +12,5 @@
   "keywords": ["telegram", "bridge", "remote", "messaging"],
   "category": "integration",
   "skills": "skills/",
-  "postInstallMessage": "Restart Copilot CLI, then run /copilot-cli-telegram-bridge:telegram-install to complete setup."
+  "postInstallMessage": "Restart Copilot CLI, then run /telegram setup <name> to register a bot or /telegram help for commands."
 }
