@@ -17,6 +17,7 @@ import {
 import { createBotStorage, loadJsonOrDefault, saveJsonAtomic } from "./bot-storage.mjs";
 import { resolveCopilotCommandPassthrough } from "./copilot-command-passthrough.mjs";
 import { createEarlyEventBuffer } from "./early-events.mjs";
+import { createExtensionKeepAlive } from "./extension-keepalive.mjs";
 import {
     buildPermissionDecision,
     getPermissionActions,
@@ -24,6 +25,7 @@ import {
 } from "./permission-decisions.mjs";
 import { createPollHealthTracker } from "./poll-health.mjs";
 import { classifyPollingConflict } from "./reconnect-policy.mjs";
+import { createSendQueue } from "./send-queue.mjs";
 import {
     buildStructuredPrompt,
     parseStructuredInputCallbackData,
@@ -248,35 +250,14 @@ finally { $recognizer.Dispose() }
 // Section 4: Send Queue (outbound message pacing)
 // ============================================================
 
-const sendQueue = [];
-let sendQueueRunning = false;
-
-function enqueue(fn) {
-    return new Promise((resolve, reject) => {
-        sendQueue.push({ fn, resolve, reject });
-        if (!sendQueueRunning) drainQueue();
-    });
-}
-
-async function drainQueue() {
-    sendQueueRunning = true;
-    while (sendQueue.length > 0) {
-        const { fn, resolve, reject } = sendQueue.shift();
-        try {
-            const result = await fn();
-            resolve(result);
-        } catch (err) {
-            if (err.status === 429) {
-                sendQueue.unshift({ fn, resolve, reject });
-                await sleep(err.retryAfter * 1000);
-                continue;
-            }
-            reject(err);
-        }
-        if (sendQueue.length > 0) await sleep(SEND_PACE_MS);
-    }
-    sendQueueRunning = false;
-}
+const { enqueue, enqueueDetached } = createSendQueue({
+    paceMs: SEND_PACE_MS,
+    sleepFn: sleep,
+    onDroppedError: (err, context) => {
+        const label = context ? `${context}: ` : "";
+        console.warn(`telegram-bridge: dropped queued Telegram send ${label}${err.message}`);
+    },
+});
 
 // ============================================================
 // Section 5: State Management
@@ -298,6 +279,7 @@ let bridgeHealth = loadBridgeHealth(HEALTH_PATH);
 let botInfo = null;
 let currentSessionId = null;
 let currentBotName = null;
+const keepAlive = createExtensionKeepAlive();
 
 // Session statistics (Feature 1: Session Summary)
 let sessionStats = { toolCalls: 0, filesEdited: new Set(), filesCreated: new Set(), connectedAt: null };
@@ -936,7 +918,7 @@ function flushMessageBatch() {
     const chunks = chunkMessage(content);
     for (const chatId of chatIds) {
         for (const chunk of chunks) {
-            enqueue(() => sendFormattedMessage(chatId, chunk));
+            enqueueDetached(() => sendFormattedMessage(chatId, chunk), "assistant message");
         }
     }
 }
@@ -987,14 +969,14 @@ function setupEventHandlers(sess) {
             }]);
 
             for (const chatId of chatIds) {
-                enqueue(() => callTelegram("sendMessage", {
+                enqueueDetached(() => callTelegram("sendMessage", {
                     chat_id: chatId,
                     text: html,
                     parse_mode: "HTML",
                     reply_markup: JSON.stringify({
                         inline_keyboard: inlineKeyboard,
                     })
-                }).catch(() => sendFormattedMessage(chatId, lines.join("\n"))));
+                }).catch(() => sendFormattedMessage(chatId, lines.join("\n"))), "permission prompt");
             }
         }, 5000);
 
@@ -1030,14 +1012,15 @@ function setupEventHandlers(sess) {
         // Show as "You (terminal):" in a distinct style, silently (no notification)
         const chatIds = getAllowedChatIds();
         const display = `👨🏿‍💻 **You:** ${content}`;
-        const html = markdownToTelegramHtml(display);
         for (const chatId of chatIds) {
-            enqueue(() => callTelegram("sendMessage", {
-                chat_id: chatId,
-                text: html,
-                parse_mode: "HTML",
-                disable_notification: true,
-            }).catch(() => sendMessage(chatId, display)));
+            for (const chunk of chunkMessage(display, 3500)) {
+                enqueueDetached(() => callTelegram("sendMessage", {
+                    chat_id: chatId,
+                    text: markdownToTelegramHtml(chunk),
+                    parse_mode: "HTML",
+                    disable_notification: true,
+                }).catch(() => sendMessage(chatId, chunk)), "terminal message echo");
+            }
         }
     });
 
@@ -1087,7 +1070,7 @@ function setupEventHandlers(sess) {
         }
         const chatIds = getAllowedChatIds();
         for (const chatId of chatIds) {
-            enqueue(() => sendFormattedMessage(chatId, errMsg));
+            enqueueDetached(() => sendFormattedMessage(chatId, errMsg), "session error");
         }
     });
 
@@ -1119,7 +1102,7 @@ function setupEventHandlers(sess) {
         if (msg) {
             const chatIds = getAllowedChatIds();
             for (const chatId of chatIds) {
-                enqueue(() => sendMessage(chatId, msg));
+                enqueueDetached(() => sendMessage(chatId, msg), "system notification");
             }
         }
     });
@@ -1149,7 +1132,7 @@ function setupEventHandlers(sess) {
             const chunks = chunkMessage(rendered);
             for (const chatId of chatIds) {
                 for (const chunk of chunks) {
-                    enqueue(() => sendFormattedMessage(chatId, chunk));
+                    enqueueDetached(() => sendFormattedMessage(chatId, chunk), "ask_user prompt");
                 }
             }
         }
@@ -1163,7 +1146,7 @@ function setupEventHandlers(sess) {
                 const chunks = chunkMessage(header);
                 for (const chatId of chatIds) {
                     for (const chunk of chunks) {
-                        enqueue(() => sendFormattedMessage(chatId, chunk));
+                        enqueueDetached(() => sendFormattedMessage(chatId, chunk), "task summary");
                     }
                 }
             }
@@ -1204,14 +1187,14 @@ function setupEventHandlers(sess) {
             }
             const chatIds = getAllowedChatIds();
             for (const chatId of chatIds) {
-                enqueue(() => sendFormattedMessage(chatId, lines.join("\n")));
+                enqueueDetached(() => sendFormattedMessage(chatId, lines.join("\n")), "file edit summary");
             }
         } else if (completed?.name === "create" && completed.args) {
             const path = completed.args.path || "unknown";
             const shortPath = path.split(/[/\\]/).slice(-2).join("/");
             const chatIds = getAllowedChatIds();
             for (const chatId of chatIds) {
-                enqueue(() => sendFormattedMessage(chatId, `📄 Created: \`${shortPath}\``));
+                enqueueDetached(() => sendFormattedMessage(chatId, `📄 Created: \`${shortPath}\``), "file create summary");
             }
         }
 
@@ -1224,16 +1207,16 @@ function setupEventHandlers(sess) {
                 const bytes = Math.ceil(block.data.length * 3 / 4);
                 if (bytes > MAX_PHOTO_BYTES) {
                     for (const chatId of chatIds) {
-                        enqueue(() => sendMessage(chatId, "(Image too large for Telegram, >10MB)"));
+                        enqueueDetached(() => sendMessage(chatId, "(Image too large for Telegram, >10MB)"), "large image notice");
                     }
                     continue;
                 }
                 for (const chatId of chatIds) {
                     if (PHOTO_MIMES.has(block.mimeType)) {
-                        enqueue(() => sendPhoto(chatId, block.data, block.mimeType));
+                        enqueueDetached(() => sendPhoto(chatId, block.data, block.mimeType), "photo relay");
                     } else {
                         const ext = block.mimeType.split("/")[1] || "bin";
-                        enqueue(() => sendDocument(chatId, block.data, block.mimeType, `image.${ext}`));
+                        enqueueDetached(() => sendDocument(chatId, block.data, block.mimeType, `image.${ext}`), "document relay");
                     }
                 }
             }
@@ -1262,15 +1245,15 @@ function createStructuredInputRequest(request, kind) {
 
         for (const chatId of chatIds) {
             if (prompt.inlineKeyboard && chunks.length === 1) {
-                enqueue(() => callTelegram("sendMessage", {
+                enqueueDetached(() => callTelegram("sendMessage", {
                     chat_id: chatId,
                     text: markdownToTelegramHtml(chunks[0]),
                     parse_mode: "HTML",
                     reply_markup: JSON.stringify({ inline_keyboard: prompt.inlineKeyboard }),
-                }).catch(() => sendFormattedMessage(chatId, chunks[0])));
+                }).catch(() => sendFormattedMessage(chatId, chunks[0])), `${kind} prompt`);
             } else {
                 for (const chunk of chunks) {
-                    enqueue(() => sendFormattedMessage(chatId, chunk));
+                    enqueueDetached(() => sendFormattedMessage(chatId, chunk), `${kind} prompt`);
                 }
             }
         }
@@ -1464,7 +1447,7 @@ async function handleConnect(name, sessionId) {
             await session.log(`Telegram bridge connected (@${botInfo.username}).`);
         }
         for (const chatId of chatIds) {
-            enqueue(() => sendMessage(chatId, statusMsg));
+            enqueueDetached(() => sendMessage(chatId, statusMsg), "connect status");
         }
     }
 
@@ -1830,6 +1813,9 @@ async function pollLoop() {
 // ============================================================
 
 async function main() {
+    if (process.env.COPILOT_TELEGRAM_BRIDGE_DISABLED === "1") {
+        return;
+    }
     registry = loadJsonOrDefault(BOTS_REGISTRY_PATH, {});
     access = loadJsonOrDefault(ACCESS_PATH, { allowedUsers: [], pending: {} });
     cleanupTmpDir();
@@ -1896,6 +1882,7 @@ async function main() {
             },
         },
     });
+    keepAlive.start();
 
     const botNames = Object.keys(registry);
     if (botNames.length === 0) {
@@ -1941,9 +1928,13 @@ async function main() {
     }
 }
 
-// SIGTERM handler
-process.on("SIGTERM", async () => {
+let processShutdownStarted = false;
+
+async function handleProcessShutdown(exitCode) {
+    if (processShutdownStarted) return;
+    processShutdownStarted = true;
     shutdownRequested = true;
+    keepAlive.stop();
     if (abortController) abortController.abort();
 
     if (connected) {
@@ -1971,10 +1962,19 @@ process.on("SIGTERM", async () => {
 
     stopTyping();
     cleanupTmpDir();
-    process.exit(0);
+    process.exit(exitCode);
+}
+
+process.on("SIGTERM", () => {
+    handleProcessShutdown(0);
+});
+
+process.on("SIGINT", () => {
+    handleProcessShutdown(130);
 });
 
 main().catch(err => {
+    keepAlive.stop();
     console.error("telegram-bridge: fatal error:", err);
     process.exit(1);
 });
